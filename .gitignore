@@ -1,0 +1,25 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.log
+.tweet_sent_date
+pending_results.json
+node_modules/
+*.credentials.json
+google_credentials.json
+
+# Credentials & secrets
+bot-teleg-490915-9602d65f1c3a.json
+*.json.bak
+*.py.bak
+*.py.bak2
+*.py.bak3
+
+# Données runtime
+alerted_picks.json
+users.json
+grandfathered.json
+footystats_cache.json

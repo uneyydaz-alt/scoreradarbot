@@ -1,0 +1,1456 @@
+"""Bot Telegram — Goal Signal Detector."""
+
+import asyncio
+import json
+import logging
+import os
+from pathlib import Path
+
+from datetime import datetime, timedelta, timezone
+import stripe
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    PreCheckoutQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+from config import (
+    TELEGRAM_BOT_TOKEN,
+    DEFAULT_CONFIDENCE_THRESHOLD,
+    CHECK_INTERVAL_SECONDS,
+    USERS_FILE,
+    POPULAR_LEAGUES,
+    CHANNEL_USERNAME,
+    CHANNEL_ID,
+    GRANDFATHERED_FILE,
+    PLANS,
+    STRIPE_SECRET_KEY,
+    ADMIN_ID,
+    REFERRAL_TIERS,
+)
+from api_football import get_live_fixtures, get_fixture_statistics, parse_fixture_info, parse_statistics, get_live_odds
+from analyzer import analyze_match, format_signal
+from google_sheets import log_alert, update_result, update_live_colors, get_pending_rows, finalize_row
+from footystats import get_todays_matches, find_match_data, parse_prematch_data
+from translations import t, get_lang, LANG_FLAGS, SUPPORTED_LANGS
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# --- Persistance des picks alertés (survit aux restarts) ---
+
+ALERTED_PICKS_FILE = Path(__file__).parent / "alerted_picks.json"
+
+
+def _load_alerted_picks() -> set:
+    """Charge les picks déjà alertés depuis le fichier."""
+    if not ALERTED_PICKS_FILE.exists():
+        return set()
+    try:
+        with open(ALERTED_PICKS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return set(data)
+    except Exception:
+        return set()
+
+
+def _save_alerted_picks(picks: set):
+    """Sauvegarde les picks alertés dans un fichier."""
+    try:
+        # Garder seulement les 500 derniers
+        picks_list = list(picks)[-500:]
+        with open(ALERTED_PICKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(picks_list, f)
+    except Exception as e:
+        logger.error("Erreur sauvegarde alerted_picks: %s", e)
+
+
+# --- Persistance des résultats en attente (survit aux restarts) ---
+
+PENDING_RESULTS_FILE = Path(__file__).parent / "pending_results.json"
+
+
+def _load_pending_results() -> dict:
+    """Charge les résultats en attente depuis le fichier."""
+    if not PENDING_RESULTS_FILE.exists():
+        return {}
+    try:
+        with open(PENDING_RESULTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_pending_results(pending: dict):
+    """Sauvegarde les résultats en attente."""
+    try:
+        with open(PENDING_RESULTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(pending, f)
+    except Exception as e:
+        logger.error("Erreur sauvegarde pending_results: %s", e)
+
+
+# --- Grandfathered members (jamais kick) ---
+# Stocke les usernames ET les user IDs pour couvrir les deux cas
+
+def _load_grandfathered() -> dict:
+    """Charge {usernames: [...], user_ids: [...]}"""
+    if not Path(GRANDFATHERED_FILE).exists():
+        return {"usernames": [], "user_ids": []}
+    try:
+        with open(GRANDFATHERED_FILE, "r") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                # Migration ancien format (liste d'IDs)
+                return {"usernames": [], "user_ids": data}
+            return data
+    except Exception:
+        return {"usernames": [], "user_ids": []}
+
+
+def _save_grandfathered(data: dict):
+    with open(GRANDFATHERED_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _is_grandfathered(user_id: int, username: str = None) -> bool:
+    gf = _load_grandfathered()
+    if user_id in gf.get("user_ids", []):
+        return True
+    if username and username.lower().lstrip("@") in [u.lower().lstrip("@") for u in gf.get("usernames", [])]:
+        return True
+    return False
+
+
+# --- Stockage utilisateurs (fichier JSON simple) ---
+
+def _load_users() -> dict:
+    """Charge les utilisateurs depuis le fichier JSON."""
+    if not Path(USERS_FILE).exists():
+        return {}
+    with open(USERS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_users(users: dict) -> None:
+    """Sauvegarde les utilisateurs dans le fichier JSON."""
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, indent=2, ensure_ascii=False)
+
+
+def _get_user(chat_id: int) -> dict:
+    """Récupère ou crée un utilisateur."""
+    users = _load_users()
+    uid = str(chat_id)
+    if uid not in users:
+        users[uid] = {
+            "active": True,
+            "threshold": DEFAULT_CONFIDENCE_THRESHOLD,
+            "leagues": list(POPULAR_LEAGUES.keys()),
+            "alerted_fixtures": [],
+            "plan": None,
+            "plan_expires": None,
+            "lang": None,
+            "referral_code": uid,
+            "referred_by": None,
+            "referral_count": 0,
+            "referral_rewarded": [],
+        }
+        _save_users(users)
+    else:
+        # Migration: ajouter les champs referral si absents
+        changed = False
+        if "referral_code" not in users[uid]:
+            users[uid]["referral_code"] = uid
+            changed = True
+        if "referred_by" not in users[uid]:
+            users[uid]["referred_by"] = None
+            changed = True
+        if "referral_count" not in users[uid]:
+            users[uid]["referral_count"] = 0
+            changed = True
+        if "referral_rewarded" not in users[uid]:
+            users[uid]["referral_rewarded"] = []
+            changed = True
+        if changed:
+            _save_users(users)
+    return users[uid]
+
+
+def _update_user(chat_id: int, data: dict) -> None:
+    """Met à jour les données d'un utilisateur."""
+    users = _load_users()
+    uid = str(chat_id)
+    if uid in users:
+        users[uid].update(data)
+        _save_users(users)
+
+
+# --- Helpers abonnement ---
+
+def _user_has_active_plan(user: dict) -> bool:
+    plan = user.get("plan")
+    if not plan:
+        return False
+    if plan == "lifetime":
+        return True
+    expires = user.get("plan_expires")
+    if not expires:
+        return False
+    return datetime.now(timezone.utc).isoformat() < expires
+
+
+def _plan_expiry_str(user: dict, lang: str = "fr") -> str:
+    if user.get("plan") == "lifetime":
+        return t("expires_never", lang)
+    expires = user.get("plan_expires")
+    if not expires:
+        return "—"
+    dt = datetime.fromisoformat(expires)
+    return dt.strftime("%d/%m/%Y %H:%M")
+
+
+async def _grant_channel_access(bot, chat_id: int):
+    if not CHANNEL_ID:
+        return None
+    try:
+        link = await bot.create_chat_invite_link(
+            chat_id=CHANNEL_ID,
+            member_limit=1,
+            name=f"user_{chat_id}",
+        )
+        return link.invite_link
+    except Exception as e:
+        logger.error("Erreur creation invite link: %s", e)
+        return None
+
+
+async def _kick_from_channel(bot, user_id: int):
+    if not CHANNEL_ID:
+        return
+    # Vérifier si grandfathered (par ID ou username)
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        username = member.user.username if member.user else None
+    except Exception:
+        username = None
+    if _is_grandfathered(user_id, username):
+        logger.info("User %d (@%s) est grandfathered, pas de kick", user_id, username)
+        return
+    try:
+        await bot.ban_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        await bot.unban_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        logger.info("Kick canal: user %d", user_id)
+    except Exception as e:
+        logger.error("Erreur kick canal user %d: %s", user_id, e)
+
+
+# --- Commandes du bot ---
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start — Affiche les plans d'abonnement."""
+    chat_id = update.effective_chat.id
+    user = _get_user(chat_id)
+    _update_user(chat_id, {"active": True})
+    tg_lang = update.effective_user.language_code if update.effective_user else None
+    lang = get_lang(user, tg_lang)
+
+    # Gerer les liens de parrainage: /start ref_XXXXX
+    if context.args and context.args[0].startswith("ref_"):
+        ref_code = context.args[0].replace("ref_", "")
+        if ref_code != str(chat_id) and not user.get("referred_by"):
+            _update_user(chat_id, {"referred_by": ref_code})
+            logger.info("User %d referred by %s", chat_id, ref_code)
+
+    if _user_has_active_plan(user):
+        plan_name = PLANS.get(user["plan"], {}).get("name", user["plan"])
+        await update.message.reply_text(
+            f"{t('start_title', lang)}\n\n"
+            f"{t('active_sub', lang, plan=plan_name, expires=_plan_expiry_str(user, lang))}\n\n"
+            f"/status — /live — /lang",
+            parse_mode="Markdown",
+        )
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(t("btn_trial", lang), callback_data="plan_trial")],
+        [InlineKeyboardButton(t("btn_monthly", lang), callback_data="plan_monthly")],
+        [InlineKeyboardButton(t("btn_semestrial", lang), callback_data="plan_semestrial")],
+        [InlineKeyboardButton(t("btn_lifetime", lang), callback_data="plan_lifetime")],
+    ]
+
+    await update.message.reply_text(
+        f"{t('start_title', lang)}\n"
+        f"\n"
+        f"{t('start_separator', lang)}\n"
+        f"\n"
+        f"{t('start_desc', lang)}\n"
+        f"\n"
+        f"{t('choose_plan', lang)}\n"
+        f"\n"
+        f"{t('plan_trial', lang)}\n"
+        f"{t('plan_monthly', lang)}\n"
+        f"{t('plan_semestrial', lang)}\n"
+        f"{t('plan_lifetime', lang)}\n"
+        f"\n"
+        f"🤝 /referral — {t('referral_short', lang)}\n"
+        f"🌍 /lang — {t('lang_short', lang)}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+
+
+async def callback_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gere les clics sur les boutons de plan."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    user = _get_user(chat_id)
+    tg_lang = query.from_user.language_code if query.from_user else None
+    lang = get_lang(user, tg_lang)
+    plan_key = query.data.replace("plan_", "")
+
+    if plan_key not in PLANS:
+        return
+
+    plan = PLANS[plan_key]
+
+    # Essai gratuit : activer directement
+    if plan_key == "trial":
+        if user.get("plan"):
+            await query.edit_message_text(t("trial_already_used", lang))
+            return
+        expires = (datetime.now(timezone.utc) + timedelta(days=3)).isoformat()
+        _update_user(chat_id, {"plan": "trial", "plan_expires": expires})
+        invite_link = await _grant_channel_access(context.bot, chat_id)
+        msg = t("trial_activated", lang) + "\n\n"
+        if invite_link:
+            msg += f"{t('join_channel', lang)}\n{invite_link}\n\n"
+        msg += t("enjoy", lang)
+        await query.edit_message_text(msg, parse_mode="Markdown")
+        return
+
+    # Plans payants : proposer Stripe ou Stars
+    stars = plan.get("stars", 0)
+    keyboard = [
+        [InlineKeyboardButton(f"💳 {t('pay_card', lang)} — {plan['price'] / 100:.2f} EUR", callback_data=f"stripe_{plan_key}")],
+        [InlineKeyboardButton(f"⭐ {t('pay_stars', lang)} — {stars} Stars", callback_data=f"stars_{plan_key}")],
+    ]
+    await query.edit_message_text(
+        f"*{plan['name']}*\n\n{t('choose_payment', lang)}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+
+
+async def callback_stripe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Paiement par carte Stripe."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    user = _get_user(chat_id)
+    tg_lang = query.from_user.language_code if query.from_user else None
+    lang = get_lang(user, tg_lang)
+    plan_key = query.data.replace("stripe_", "")
+
+    if plan_key not in PLANS:
+        return
+
+    plan = PLANS[plan_key]
+
+    if not STRIPE_SECRET_KEY:
+        await query.edit_message_text(t("payment_not_configured", lang))
+        return
+
+    try:
+        stripe.api_key = STRIPE_SECRET_KEY
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": {
+                    "currency": "eur",
+                    "product_data": {"name": f"ScoreRadar — {plan['name']}"},
+                    "unit_amount": plan["price"],
+                },
+                "quantity": 1,
+            }],
+            mode="payment",
+            client_reference_id=f"{chat_id}_{plan_key}",
+            success_url="https://t.me/ScoreRadarFR_Bot?start=paid",
+            cancel_url="https://t.me/ScoreRadarFR_Bot?start=cancel",
+        )
+        keyboard = [[InlineKeyboardButton(t("pay_now", lang), url=session.url)]]
+        await query.edit_message_text(
+            f"*{plan['name']}* — {plan['price'] / 100:.2f} EUR\n\n"
+            f"{t('click_to_pay', lang)}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error("Erreur Stripe Checkout: %s", e)
+        await query.edit_message_text(t("payment_error", lang))
+
+
+async def callback_stars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Paiement par Telegram Stars."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    user = _get_user(chat_id)
+    tg_lang = query.from_user.language_code if query.from_user else None
+    lang = get_lang(user, tg_lang)
+    plan_key = query.data.replace("stars_", "")
+
+    if plan_key not in PLANS:
+        return
+
+    plan = PLANS[plan_key]
+    stars = plan.get("stars", 0)
+
+    if stars <= 0:
+        return
+
+    try:
+        await context.bot.send_invoice(
+            chat_id=chat_id,
+            title=f"ScoreRadar — {plan['name']}",
+            description=t("stars_invoice_desc", lang, plan=plan['name']),
+            payload=f"{chat_id}_{plan_key}",
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label=plan['name'], amount=stars)],
+        )
+    except Exception as e:
+        logger.error("Erreur Stars invoice: %s", e)
+        await query.edit_message_text(t("payment_error", lang))
+
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Repond au PreCheckoutQuery pour Telegram Stars."""
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gere le paiement Stars reussi."""
+    payment = update.message.successful_payment
+    payload = payment.invoice_payload
+
+    if "_" not in payload:
+        return
+
+    parts = payload.split("_", 1)
+    chat_id = int(parts[0])
+    plan_key = parts[1]
+
+    if plan_key not in PLANS:
+        return
+
+    plan = PLANS[plan_key]
+    user = _get_user(chat_id)
+    tg_lang = update.effective_user.language_code if update.effective_user else None
+    lang = get_lang(user, tg_lang)
+
+    if plan_key == "lifetime":
+        _update_user(chat_id, {"plan": "lifetime", "plan_expires": None})
+    else:
+        expires = (datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])).isoformat()
+        _update_user(chat_id, {"plan": plan_key, "plan_expires": expires})
+
+    invite_link = await _grant_channel_access(context.bot, chat_id)
+
+    msg = t("payment_received", lang, plan=plan['name']) + "\n\n"
+    if invite_link:
+        msg += f"{t('join_channel', lang)}\n{invite_link}\n\n"
+    if plan_key == "lifetime":
+        msg += t("lifetime_thanks", lang)
+    else:
+        user = _get_user(chat_id)
+        msg += t("expires_on", lang, date=_plan_expiry_str(user, lang))
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+    logger.info("Stars paiement OK: user %d -> plan %s", chat_id, plan_key)
+
+    # Crediter le parrain
+    user = _get_user(chat_id)
+    referrer = user.get("referred_by")
+    if referrer:
+        referrer_user = _get_user(int(referrer))
+        new_count = referrer_user.get("referral_count", 0) + 1
+        _update_user(int(referrer), {"referral_count": new_count})
+        await _check_referral_rewards(context.bot, int(referrer))
+        logger.info("Referral credit (Stars): user %s -> parrain %s (total: %d)", chat_id, referrer, new_count)
+
+
+async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/activate <user_id> <plan> — Admin: activer manuellement un plan."""
+    chat_id = update.effective_chat.id
+    if chat_id != ADMIN_ID:
+        return
+
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text("Usage: /activate <user_id> <trial|monthly|semestrial|lifetime>")
+        return
+
+    target_id = int(args[0])
+    plan_key = args[1]
+    if plan_key not in PLANS:
+        await update.message.reply_text(f"Plan inconnu: {plan_key}")
+        return
+
+    plan = PLANS[plan_key]
+    if plan_key == "lifetime":
+        _update_user(target_id, {"plan": "lifetime", "plan_expires": None})
+    else:
+        expires = (datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])).isoformat()
+        _update_user(target_id, {"plan": plan_key, "plan_expires": expires})
+
+    invite_link = await _grant_channel_access(context.bot, target_id)
+    if invite_link:
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"✅ Ton abonnement *{plan['name']}* a ete active !\n\nRejoins le canal :\n{invite_link}",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+    await update.message.reply_text(f"OK — User {target_id} active sur plan {plan_key}")
+
+
+async def _check_referral_rewards(bot, referrer_id: int):
+    """Verifie et attribue les recompenses de parrainage."""
+    user = _get_user(referrer_id)
+    count = user.get("referral_count", 0)
+    rewarded = user.get("referral_rewarded", [])
+    lang = get_lang(user)
+
+    for threshold, tier in sorted(REFERRAL_TIERS.items()):
+        if count >= threshold and threshold not in rewarded:
+            reward = tier["reward"]
+            if reward == "lifetime":
+                _update_user(referrer_id, {"plan": "lifetime", "plan_expires": None})
+            elif reward == "semestrial_3m":
+                expires = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat()
+                current = user.get("plan_expires")
+                if current and current > datetime.now(timezone.utc).isoformat():
+                    base = datetime.fromisoformat(current)
+                else:
+                    base = datetime.now(timezone.utc)
+                expires = (base + timedelta(days=90)).isoformat()
+                _update_user(referrer_id, {"plan": "semestrial", "plan_expires": expires})
+            else:
+                current = user.get("plan_expires")
+                if current and current > datetime.now(timezone.utc).isoformat():
+                    base = datetime.fromisoformat(current)
+                else:
+                    base = datetime.now(timezone.utc)
+                duration = PLANS.get(reward, {}).get("duration_days", 30)
+                expires = (base + timedelta(days=duration)).isoformat()
+                _update_user(referrer_id, {"plan": reward, "plan_expires": expires})
+
+            rewarded.append(threshold)
+            _update_user(referrer_id, {"referral_rewarded": rewarded})
+
+            invite_link = await _grant_channel_access(bot, referrer_id)
+            msg = t("referral_reward", lang, count=threshold, reward=tier["label"])
+            if invite_link:
+                msg += f"\n\n{t('join_channel', lang)}\n{invite_link}"
+            try:
+                await bot.send_message(chat_id=referrer_id, text=msg, parse_mode="Markdown")
+            except Exception:
+                pass
+            logger.info("Referral reward: user %d atteint %d filleuls -> %s", referrer_id, threshold, reward)
+
+
+async def cmd_referral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/referral — Affiche le lien de parrainage et les stats."""
+    chat_id = update.effective_chat.id
+    user = _get_user(chat_id)
+    tg_lang = update.effective_user.language_code if update.effective_user else None
+    lang = get_lang(user, tg_lang)
+
+    ref_code = user.get("referral_code", str(chat_id))
+    count = user.get("referral_count", 0)
+    link = f"https://t.me/ScoreRadarFR_Bot?start=ref_{ref_code}"
+
+    # Prochain palier
+    next_tier = None
+    for threshold in sorted(REFERRAL_TIERS.keys()):
+        if count < threshold:
+            next_tier = threshold
+            break
+
+    await update.message.reply_text(
+        t("referral_info", lang, link=link, count=count, next_tier=next_tier or "✅",
+          next_reward=REFERRAL_TIERS.get(next_tier, {}).get("label", t("referral_all_unlocked", lang))),
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/lang — Choisir la langue."""
+    chat_id = update.effective_chat.id
+    user = _get_user(chat_id)
+    tg_lang = update.effective_user.language_code if update.effective_user else None
+    lang = get_lang(user, tg_lang)
+
+    keyboard = []
+    for code, label in LANG_FLAGS.items():
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"lang_{code}")])
+
+    await update.message.reply_text(
+        t("lang_title", lang),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+
+
+async def callback_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gere les clics sur les boutons de langue."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    lang_code = query.data.replace("lang_", "")
+
+    if lang_code not in SUPPORTED_LANGS:
+        return
+
+    _update_user(chat_id, {"lang": lang_code})
+    await query.edit_message_text(t("lang_set", lang_code), parse_mode="Markdown")
+
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stop — Désactive les alertes."""
+    chat_id = update.effective_chat.id
+    user = _get_user(chat_id)
+    tg_lang = update.effective_user.language_code if update.effective_user else None
+    lang = get_lang(user, tg_lang)
+    _update_user(chat_id, {"active": False})
+    await update.message.reply_text(t("alerts_off", lang))
+
+
+async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/live — Affiche les matchs en cours."""
+    chat_id = update.effective_chat.id
+    user = _get_user(chat_id)
+    tg_lang = update.effective_user.language_code if update.effective_user else None
+    lang = get_lang(user, tg_lang)
+
+    await update.message.reply_text(t("loading_matches", lang))
+
+    fixtures = await get_live_fixtures(user["leagues"])
+
+    if not fixtures:
+        await update.message.reply_text(t("no_live_matches", lang))
+        return
+
+    lines = [f"{t('live_title', lang)}\n", f"{t('start_separator', lang)}\n"]
+
+    current_league = ""
+    for fixture in fixtures:
+        info = parse_fixture_info(fixture)
+        league = info["league_name"]
+        if league != current_league:
+            current_league = league
+            lines.append(f"\n🏆 *{league}*")
+
+        lines.append(
+            f"  {info['home_team']} {info['home_goals']}-{info['away_goals']} "
+            f"{info['away_team']} ({info['elapsed']}')"
+        )
+
+    lines.append(f"\n\n{t('matches_count', lang, count=len(fixtures))}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/leagues — Sélectionner les championnats à suivre."""
+    chat_id = update.effective_chat.id
+    user = _get_user(chat_id)
+    tg_lang = update.effective_user.language_code if update.effective_user else None
+    lang = get_lang(user, tg_lang)
+    user_leagues = user.get("leagues", [])
+
+    keyboard = []
+    for league_id, league_name in POPULAR_LEAGUES.items():
+        status = "✅" if league_id in user_leagues else "❌"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{status} {league_name}",
+                callback_data=f"league_{league_id}",
+            )
+        ])
+
+    keyboard.append([InlineKeyboardButton(t("select_all", lang), callback_data="league_all")])
+    keyboard.append([InlineKeyboardButton(t("deselect_all", lang), callback_data="league_none")])
+
+    await update.message.reply_text(
+        t("leagues_title", lang),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+
+
+async def callback_league(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gère les clics sur les boutons de ligues."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    user = _get_user(chat_id)
+    user_leagues = user.get("leagues", [])
+
+    data = query.data
+
+    if data == "league_all":
+        user_leagues = list(POPULAR_LEAGUES.keys())
+    elif data == "league_none":
+        user_leagues = []
+    elif data.startswith("league_"):
+        league_id = int(data.replace("league_", ""))
+        if league_id in user_leagues:
+            user_leagues.remove(league_id)
+        else:
+            user_leagues.append(league_id)
+
+    _update_user(chat_id, {"leagues": user_leagues})
+
+    # Rafraîchir le clavier
+    keyboard = []
+    for league_id, league_name in POPULAR_LEAGUES.items():
+        status = "✅" if league_id in user_leagues else "❌"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{status} {league_name}",
+                callback_data=f"league_{league_id}",
+            )
+        ])
+    user = _get_user(chat_id)
+    tg_lang = query.from_user.language_code if query.from_user else None
+    lang = get_lang(user, tg_lang)
+    keyboard.append([InlineKeyboardButton(t("select_all", lang), callback_data="league_all")])
+    keyboard.append([InlineKeyboardButton(t("deselect_all", lang), callback_data="league_none")])
+
+    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def cmd_sensitivity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/sensitivity [valeur] — Régler le seuil de confiance."""
+    chat_id = update.effective_chat.id
+    user = _get_user(chat_id)
+    tg_lang = update.effective_user.language_code if update.effective_user else None
+    lang = get_lang(user, tg_lang)
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            f"{t('sensitivity_title', lang)}\n\n"
+            f"{t('sensitivity_current', lang, value=user['threshold'])}\n\n"
+            f"{t('sensitivity_usage', lang)}",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        value = int(args[0])
+        if not 10 <= value <= 95:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(t("sensitivity_invalid", lang))
+        return
+
+    _update_user(chat_id, {"threshold": value})
+    await update.message.reply_text(t("sensitivity_updated", lang, value=value), parse_mode="Markdown")
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/status — Affiche la config actuelle."""
+    chat_id = update.effective_chat.id
+    user = _get_user(chat_id)
+    tg_lang = update.effective_user.language_code if update.effective_user else None
+    lang = get_lang(user, tg_lang)
+
+    league_names = [
+        POPULAR_LEAGUES.get(lid, f"ID:{lid}")
+        for lid in user.get("leagues", [])
+    ]
+
+    status = t("status_active", lang) if user.get("active") else t("status_inactive", lang)
+
+    await update.message.reply_text(
+        f"{t('status_title', lang)}\n\n"
+        f"{t('start_separator', lang)}\n"
+        f"\n"
+        f"{status}\n"
+        f"{t('status_threshold', lang, value=user.get('threshold', DEFAULT_CONFIDENCE_THRESHOLD))}\n"
+        f"{t('status_leagues', lang, count=len(league_names))}\n"
+        + "\n".join(f"  • {name}" for name in league_names[:10])
+        + (f"\n{t('status_more', lang, count=len(league_names) - 10)}" if len(league_names) > 10 else "")
+        + f"\n\n{t('status_scan', lang, interval=CHECK_INTERVAL_SECONDS)}",
+        parse_mode="Markdown",
+    )
+
+
+
+
+# --- /best — Top 5 picks de la semaine ---
+
+async def cmd_best(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/best — Affiche les 5 meilleurs picks de la semaine."""
+    chat_id = update.effective_chat.id
+    user = _get_user(chat_id)
+    tg_lang = update.effective_user.language_code if update.effective_user else None
+    lang = get_lang(user, tg_lang)
+
+    try:
+        from google_sheets import get_week_results
+        results = get_week_results()
+    except Exception as e:
+        logger.error("Erreur /best: %s", e)
+        await update.message.reply_text("Erreur lors de la recuperation des donnees.")
+        return
+
+    if not results:
+        await update.message.reply_text("Aucun pick cette semaine.")
+        return
+
+    # Trier par confiance decroissante, prendre les 5 meilleurs gagnes
+    wins = [r for r in results if r.get("result") == "Win"]
+    wins.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+    top5 = wins[:5]
+
+    if not top5:
+        await update.message.reply_text("Aucun pick gagnant cette semaine (pour l'instant).")
+        return
+
+    lines = ["⭐ TOP 5 PICKS DE LA SEMAINE
+"]
+    for i, r in enumerate(top5, 1):
+        lines.append(
+            f"{i}. {r['teams']} — {r.get('pick', '?')}
+"
+            f"   Confiance: {r.get('confidence', '?')}/100 • Score: {r.get('score', '?')}
+"
+        )
+
+    total = len(results)
+    total_wins = len(wins)
+    wr = round(total_wins / total * 100) if total > 0 else 0
+    lines.append(f"
+📊 Semaine: {total_wins}/{total} ({wr}% winrate)")
+
+    await update.message.reply_text("
+".join(lines))
+
+
+# --- /next — Prochains matchs avec potentiel d'alerte ---
+
+async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/next — Affiche les prochains matchs interessants."""
+    chat_id = update.effective_chat.id
+    user = _get_user(chat_id)
+    tg_lang = update.effective_user.language_code if update.effective_user else None
+    lang = get_lang(user, tg_lang)
+
+    try:
+        from footystats import get_todays_matches, parse_prematch_data
+        matches = await get_todays_matches()
+    except Exception as e:
+        logger.error("Erreur /next: %s", e)
+        await update.message.reply_text("Erreur lors de la recuperation des donnees.")
+        return
+
+    if not matches:
+        await update.message.reply_text("Aucun match prevu aujourd'hui.")
+        return
+
+    # Filtrer les matchs pas encore commences ou en cours
+    interesting = []
+    for m in matches:
+        pm = parse_prematch_data(m)
+        avg = pm.get("avg_potential", 0)
+        btts = pm.get("btts_potential", 0)
+        odds_o25 = pm.get("odds_ft_over25", 0)
+
+        # Score de potentiel
+        potential = 0
+        if avg > 2.5:
+            potential += 30
+        elif avg > 2.0:
+            potential += 15
+        if btts > 60:
+            potential += 25
+        elif btts > 50:
+            potential += 10
+        if 0 < odds_o25 < 1.8:
+            potential += 25
+        elif 0 < odds_o25 < 2.0:
+            potential += 10
+
+        if potential >= 20:
+            interesting.append({
+                "home": m.get("home_name", "?"),
+                "away": m.get("away_name", "?"),
+                "league": m.get("competition_name", "?"),
+                "avg": avg,
+                "btts": btts,
+                "odds_o25": odds_o25,
+                "potential": potential,
+            })
+
+    interesting.sort(key=lambda x: x["potential"], reverse=True)
+    top = interesting[:8]
+
+    if not top:
+        await update.message.reply_text("Aucun match a fort potentiel aujourd'hui.")
+        return
+
+    lines = ["🔎 MATCHS A SURVEILLER
+"]
+    for m in top:
+        odds_str = f"@{m['odds_o25']:.2f}" if m['odds_o25'] > 0 else ""
+        btts_str = f"BTTS {m['btts']:.0f}%" if m['btts'] > 0 else ""
+        avg_str = f"Avg {m['avg']:.1f}" if m['avg'] > 0 else ""
+        details = " • ".join(x for x in [avg_str, btts_str, odds_str] if x)
+        lines.append(
+            f"🏆 {m['league']}
+"
+            f"  {m['home']} vs {m['away']}
+"
+            f"  {details}
+"
+        )
+
+    lines.append(f"
+{len(interesting)} matchs a potentiel detectes.")
+    await update.message.reply_text("
+".join(lines))
+
+
+# --- Job verification paiements Stripe ---
+
+async def check_stripe_payments(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Verifie les paiements Stripe completes et active les plans."""
+    if not STRIPE_SECRET_KEY:
+        return
+
+    stripe.api_key = STRIPE_SECRET_KEY
+
+    try:
+        # Chercher les sessions payees dans les 10 dernieres minutes
+        sessions = stripe.checkout.Session.list(
+            status="complete",
+            created={"gte": int((datetime.now(timezone.utc) - timedelta(minutes=10)).timestamp())},
+            limit=20,
+        )
+    except Exception as e:
+        logger.error("Erreur Stripe list sessions: %s", e)
+        return
+
+    for session in sessions.data:
+        ref = session.client_reference_id
+        if not ref or "_" not in ref:
+            continue
+
+        parts = ref.split("_", 1)
+        chat_id = int(parts[0])
+        plan_key = parts[1]
+
+        if plan_key not in PLANS:
+            continue
+
+        # Verifier si deja active (eviter doublon)
+        user = _get_user(chat_id)
+        if user.get("stripe_last_session") == session.id:
+            continue
+
+        plan = PLANS[plan_key]
+        if plan_key == "lifetime":
+            _update_user(chat_id, {"plan": "lifetime", "plan_expires": None, "stripe_last_session": session.id})
+        else:
+            expires = (datetime.now(timezone.utc) + timedelta(days=plan["duration_days"])).isoformat()
+            _update_user(chat_id, {"plan": plan_key, "plan_expires": expires, "stripe_last_session": session.id})
+
+        invite_link = await _grant_channel_access(context.bot, chat_id)
+
+        user = _get_user(chat_id)
+        lang = get_lang(user)
+        msg = t("payment_received", lang, plan=plan['name']) + "\n\n"
+        if invite_link:
+            msg += f"{t('join_channel', lang)}\n{invite_link}\n\n"
+        if plan_key == "lifetime":
+            msg += t("lifetime_thanks", lang)
+        else:
+            msg += t("expires_on", lang, date=_plan_expiry_str(user, lang))
+
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+        except Exception:
+            pass
+
+        logger.info("Stripe paiement OK: user %d -> plan %s (session %s)", chat_id, plan_key, session.id)
+
+        # Crediter le parrain si le user a ete parraine
+        user = _get_user(chat_id)
+        referrer = user.get("referred_by")
+        if referrer:
+            referrer_user = _get_user(int(referrer))
+            new_count = referrer_user.get("referral_count", 0) + 1
+            _update_user(int(referrer), {"referral_count": new_count})
+            await _check_referral_rewards(context.bot, int(referrer))
+            logger.info("Referral credit: user %s -> parrain %s (total: %d)", chat_id, referrer, new_count)
+
+
+# --- Job auto-kick des abonnements expires ---
+
+async def check_expired_plans(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Verifie toutes les minutes les plans expires et kick du canal."""
+    users = _load_users()
+    now = datetime.now(timezone.utc).isoformat()
+
+    for uid, user_data in users.items():
+        plan = user_data.get("plan")
+        if not plan or plan == "lifetime":
+            continue
+        expires = user_data.get("plan_expires")
+        if not expires:
+            continue
+        if now >= expires:
+            # Plan expire
+            _update_user(int(uid), {"plan": None, "plan_expires": None})
+            await _kick_from_channel(context.bot, int(uid))
+            user_data_fresh = _get_user(int(uid))
+            lang = get_lang(user_data_fresh)
+            try:
+                await context.bot.send_message(
+                    chat_id=int(uid),
+                    text=t("sub_expired", lang),
+                )
+            except Exception:
+                pass
+            logger.info("Plan expire: user %s kick du canal", uid)
+
+
+# --- Scheduler : analyse automatique des matchs ---
+
+async def check_matches(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Job planifié — vérifie les matchs et envoie des alertes."""
+    users = _load_users()
+
+    if not users:
+        return
+
+    # Récupérer toutes les ligues suivies par au moins un utilisateur
+    all_leagues = set()
+    for user_data in users.values():
+        if user_data.get("active"):
+            all_leagues.update(user_data.get("leagues", []))
+
+    if not all_leagues:
+        return
+
+    # --- Scan intelligent: mode nuit (skip analyse, garde finalization) ---
+    import time as _time_mod
+    now_utc = datetime.now(timezone.utc)
+    is_night = now_utc.hour < 10 or now_utc.hour >= 23  # 0h-10h / 23h+ UTC
+    skip_analysis = False
+
+    if is_night:
+        if not hasattr(check_matches, "_last_night_scan"):
+            check_matches._last_night_scan = 0
+        if (_time_mod.time() - check_matches._last_night_scan) < 600:  # 10 min
+            logger.debug("Mode nuit: skip analyse (dernier < 10 min)")
+            skip_analysis = True
+        else:
+            check_matches._last_night_scan = _time_mod.time()
+
+    fixtures = []
+    if not skip_analysis:
+        logger.debug("Scan des matchs en direct (%d ligues)...", len(all_leagues))
+        try:
+            fixtures = await get_live_fixtures(list(all_leagues))
+        except Exception as e:
+            logger.error("Erreur lors de la récupération des matchs: %s", e)
+            fixtures = []
+
+        if not fixtures:
+            logger.debug("Aucun match en direct.")
+        else:
+            logger.debug("Analyse de %d matchs...", len(fixtures))
+
+    # Charger les données pré-match FootyStats (avec cache 30 min)
+    try:
+        footystats_matches = await get_todays_matches()
+    except Exception as e:
+        logger.error("Erreur FootyStats: %s", e)
+        footystats_matches = []
+
+    for fixture in fixtures:
+        info = parse_fixture_info(fixture)
+        fixture_id = info["fixture_id"]
+
+        # Ignorer les matchs pas encore commencés ou terminés
+        if info["status_short"] not in ("1H", "2H", "HT", "ET", "P"):
+            continue
+
+        # Skip matchs < 25 min (sauf si deja alerte et buts depuis)
+        if elapsed and elapsed < 25:
+            fid_str = str(fixture_id)
+            if hasattr(check_matches, "_pending_results") and fid_str in check_matches._pending_results:
+                # Deja alerte: re-scanner si nouveau but
+                pending_entry = check_matches._pending_results[fid_str]
+                current_total = info["home_goals"] + info["away_goals"]
+                if current_total <= pending_entry.get("goals_at_alert", 0):
+                    continue  # Pas de nouveau but, skip
+                # Nouveau but apres alerte -> on re-scanne
+            else:
+                continue  # Pas encore 25 min, pas d alerte -> skip
+
+        try:
+            stats_raw = await get_fixture_statistics(fixture_id)
+            await asyncio.sleep(0.25)  # Éviter le rate limit API-Football
+        except Exception as e:
+            logger.error("Erreur stats fixture %s: %s", fixture_id, e)
+            continue
+
+        if not stats_raw:
+            continue
+
+        # Chercher les données pré-match FootyStats
+        prematch = None
+        if footystats_matches:
+            fs_match = find_match_data(info["home_team"], info["away_team"], footystats_matches)
+            if fs_match:
+                prematch = parse_prematch_data(fs_match)
+                logger.info("FootyStats match: %s vs %s -> odds_over25=%.2f",
+                            info["home_team"], info["away_team"],
+                            prematch.get("odds_ft_over25", 0))
+            else:
+                logger.warning("FootyStats: pas de match trouvé pour %s vs %s",
+                               info["home_team"], info["away_team"])
+        else:
+            logger.warning("FootyStats: aucun match du jour chargé")
+
+        stats = parse_statistics(stats_raw)
+        signal = analyze_match(info, stats, prematch=prematch)
+
+        if signal is None:
+            continue
+
+        confidence = signal["confidence"]
+        elapsed = info.get("elapsed", 0)
+        message = format_signal(signal, lang="en")  # Canal en anglais
+
+        # Temps additionnel : en 1ère mi-temps (1H), elapsed peut dépasser 45
+        # (ex: 45+3 = 48). On normalise pour que les seuils s'appliquent
+        # correctement. En 2H, elapsed > 90 = temps additionnel fin de match.
+        status_short = info["status_short"]
+        effective_elapsed = elapsed
+        if status_short == "1H" and elapsed > 45:
+            effective_elapsed = 45  # Temps additionnel 1ère mi-temps → traiter comme 45'
+        elif status_short == "HT":
+            effective_elapsed = 45  # Mi-temps → traiter comme 45'
+
+        # Bloquer les alertes après 85' sauf prolongations (ET/P)
+        # Les matchs de coupe/Europe peuvent avoir des prolongations
+        if effective_elapsed >= 85 and status_short not in ("ET", "P"):
+            continue
+
+        # Seuil dynamique selon la minute du match
+        # Plus le match avance, plus on exige de confiance
+        if effective_elapsed >= 80:
+            min_confidence = 93
+        elif effective_elapsed >= 70:
+            min_confidence = 85
+        else:
+            min_confidence = 75
+
+        if confidence < min_confidence:
+            continue
+
+        # Anti-spam : 1 seule alerte par pick (même match + même Over = bloqué)
+        total_goals = info["home_goals"] + info["away_goals"]
+        pick_key = f"{fixture_id}_over{total_goals}"  # ex: "12345_over2" = Over 2.5
+        if not hasattr(check_matches, "_alerted_picks"):
+            check_matches._alerted_picks = _load_alerted_picks()
+
+        if pick_key in check_matches._alerted_picks:
+            continue
+
+        # Récupérer la cote live Over au moment du bet
+        over_line = total_goals + 0.5  # ex: 0 buts → Over 0.5, 2 buts → Over 2.5
+        try:
+            live_odd = await get_live_odds(fixture_id, over_line)
+            if live_odd:
+                signal["live_odds"] = live_odd
+                logger.info("Cote live Over %.1f: %.2f (%s vs %s)",
+                            over_line, live_odd, info["home_team"], info["away_team"])
+        except Exception as e:
+            logger.error("Erreur récup cote live: %s", e)
+
+        # Envoyer dans le canal
+        if CHANNEL_USERNAME:
+            try:
+                await context.bot.send_message(chat_id=CHANNEL_USERNAME, text=message)
+                check_matches._alerted_picks.add(pick_key)
+                _save_alerted_picks(check_matches._alerted_picks)
+                logger.info("Alerte canal pour %s vs %s (conf: %d, pick: Over %.1f)",
+                            info["home_team"], info["away_team"], confidence, total_goals + 0.5)
+                # Logger dans Google Sheets
+                try:
+                    row_num = log_alert(signal, fixture_id=fixture_id)
+                    if row_num:
+                        if not hasattr(check_matches, "_pending_results"):
+                            check_matches._pending_results = _load_pending_results()
+                        if str(fixture_id) not in check_matches._pending_results:
+                            check_matches._pending_results[str(fixture_id)] = {
+                                "row_nums": [],
+                                "home": info["home_team"],
+                                "away": info["away_team"],
+                                "goals_at_alert": total_goals,
+                                "pick": "Over %.1f FT" % (total_goals + 0.5),
+                                "notified_win": False,
+                            }
+                        if row_num not in check_matches._pending_results[str(fixture_id)]["row_nums"]:
+                            check_matches._pending_results[str(fixture_id)]["row_nums"].append(row_num)
+                        _save_pending_results(check_matches._pending_results)
+                except Exception as sheet_err:
+                    logger.error("Erreur Google Sheets: %s", sheet_err)
+            except Exception as e:
+                logger.error("Erreur envoi canal: %s", e)
+
+        # Envoyer aux utilisateurs en DM
+        for uid, user_data in users.items():
+            if not user_data.get("active"):
+                continue
+            if confidence < user_data.get("threshold", DEFAULT_CONFIDENCE_THRESHOLD):
+                continue
+            if info["league_id"] not in user_data.get("leagues", []):
+                continue
+
+            alerted = user_data.get("alerted_fixtures", [])
+            if pick_key in alerted:
+                continue
+
+            try:
+                user_lang = get_lang(user_data)
+                user_message = format_signal(signal, lang=user_lang)
+                await context.bot.send_message(chat_id=int(uid), text=user_message)
+                alerted.append(pick_key)
+                _update_user(int(uid), {"alerted_fixtures": alerted[-50:]})
+                logger.info("Alerte DM à %s pour %s vs %s (conf: %d, lang: %s)",
+                            uid, info["home_team"], info["away_team"], confidence, user_lang)
+            except Exception as e:
+                logger.error("Erreur envoi à %s: %s", uid, e)
+
+    # --- Vérifier les résultats (live + terminés) ---
+    if not hasattr(check_matches, "_pending_results"):
+        check_matches._pending_results = _load_pending_results()
+
+    if check_matches._pending_results:
+        # Récupérer TOUS les matchs live (pas filtrés) pour détecter les terminés
+        try:
+            all_fixtures = await get_live_fixtures()
+        except Exception:
+            all_fixtures = []
+
+        # Construire un dict des matchs en cours par fixture_id (string keys)
+        live_ids = set()
+        live_fixtures = {}
+        finished_fixtures = {}
+        for f in all_fixtures:
+            fi = parse_fixture_info(f)
+            fid = str(fi["fixture_id"])
+            live_ids.add(fid)
+            if fi["status_short"] in ("FT", "AET", "PEN"):
+                finished_fixtures[fid] = fi
+            else:
+                live_fixtures[fid] = fi
+
+        # Vérifier chaque alerte en attente
+        to_remove = []
+        for fid, pending in check_matches._pending_results.items():
+            # Match terminé → résultat final
+            if fid in finished_fixtures:
+                fi = finished_fixtures[fid]
+                final_goals = fi["home_goals"] + fi["away_goals"]
+                final_score = "%d - %d" % (fi["home_goals"], fi["away_goals"])
+
+                try:
+                    update_result(pending["row_nums"], final_score, final_goals, fixture_id=fid)
+                    logger.info("Resultat: %s vs %s -> score final: %s (%d lignes)",
+                                pending["home"], pending["away"], final_score,
+                                len(pending["row_nums"]))
+                except Exception as e:
+                    logger.error("Erreur update resultat: %s", e)
+                to_remove.append(fid)
+
+            # Match encore en cours → colorer en vert les picks déjà validés
+            elif fid in live_fixtures:
+                fi = live_fixtures[fid]
+                current_goals = fi["home_goals"] + fi["away_goals"]
+                try:
+                    update_live_colors(pending["row_nums"], current_goals)
+                except Exception as e:
+                    logger.error("Erreur update live colors: %s", e)
+
+                # Notif Win: but marqué après l'alerte
+                goals_at = pending.get("goals_at_alert", 0)
+                if current_goals > goals_at and not pending.get("notified_win", False):
+                    over_line = "Over %.1f" % (goals_at + 0.5)
+                    win_msg = "%s %d-%d %s - %s \u2705" % (
+                        pending["home"], fi["home_goals"], fi["away_goals"],
+                        pending["away"], over_line)
+                    # Envoyer au canal
+                    if CHANNEL_USERNAME:
+                        try:
+                            await context.bot.send_message(chat_id=CHANNEL_USERNAME, text=win_msg)
+                        except Exception:
+                            pass
+                    # Envoyer aux users actifs
+                    for uid, user_data in users.items():
+                        if user_data.get("active"):
+                            try:
+                                await context.bot.send_message(chat_id=int(uid), text=win_msg)
+                            except Exception:
+                                pass
+                    pending["notified_win"] = True
+                    _save_pending_results(check_matches._pending_results)
+                    logger.info("Win notif: %s vs %s -> %s", pending["home"], pending["away"], over_line)
+
+            # Match plus en live du tout (terminé entre-temps)
+            elif fid not in live_ids:
+                to_remove.append(fid)
+
+        if to_remove:
+            for fid in to_remove:
+                del check_matches._pending_results[fid]
+            _save_pending_results(check_matches._pending_results)
+
+    # --- Scanner le sheet pour les "En cours" orphelins (toutes les 5 min) ---
+    if not hasattr(check_matches, "_last_sheet_scan"):
+        check_matches._last_sheet_scan = 0
+
+    import time as _time
+    now_ts = _time.time()
+    if now_ts - check_matches._last_sheet_scan > 300:  # 5 minutes
+        check_matches._last_sheet_scan = now_ts
+        try:
+            pending_rows = get_pending_rows()
+            logger.info("Sheet scan: %d lignes 'En cours' trouvées", len(pending_rows))
+            if pending_rows:
+                # Récupérer tous les matchs live (sans filtre) pour le score actuel
+                try:
+                    all_fx = await get_live_fixtures()
+                except Exception:
+                    all_fx = []
+
+                # Construire dict: "equipe1 - equipe2" -> fixture_info
+                live_by_teams = {}
+                finished_by_teams = {}
+                for f in all_fx:
+                    fi = parse_fixture_info(f)
+                    team_key = "%s - %s" % (fi["home_team"], fi["away_team"])
+                    if fi["status_short"] in ("FT", "AET", "PEN"):
+                        finished_by_teams[team_key] = fi
+                    else:
+                        live_by_teams[team_key] = fi
+
+                for pr in pending_rows:
+                    teams = pr["teams"]
+                    row_num = pr["row_num"]
+
+                    if teams in finished_by_teams:
+                        fi = finished_by_teams[teams]
+                        total = fi["home_goals"] + fi["away_goals"]
+                        finalize_row(row_num, total)
+                        logger.info("Sheet scan: %s terminé -> finalisé ligne %d", teams, row_num)
+                    elif teams in live_by_teams:
+                        fi = live_by_teams[teams]
+                        total = fi["home_goals"] + fi["away_goals"]
+                        update_live_colors([row_num], total)
+                        logger.info("Sheet scan: %s en cours -> vérif live ligne %d", teams, row_num)
+                    elif all_fx:
+                        # Match disparu de l'API = terminé sans suivi
+                        # Score n'a pas bougé depuis l'alerte -> finaliser avec score de l'alerte
+                        score = pr.get("score_at_alert", "0 - 0")
+                        if " - " in score:
+                            parts = score.split(" - ")
+                            goals = int(parts[0].strip()) + int(parts[1].strip())
+                        else:
+                            goals = 0
+                        finalize_row(row_num, goals)
+                        logger.info("Sheet scan: %s disparu de l'API -> finalisé ligne %d (score alerte: %s)",
+                                     teams, row_num, score)
+
+        except Exception as e:
+            logger.error("Erreur scan sheet: %s", e)
+
+
+# --- Main ---
+
+def main() -> None:
+    """Lance le bot."""
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "ton_token_ici":
+        print("❌ ERREUR: Configure ton token Telegram dans le fichier .env")
+        print("   TELEGRAM_BOT_TOKEN=ton_token_ici")
+        return
+
+    from config import API_FOOTBALL_KEY
+    if not API_FOOTBALL_KEY or API_FOOTBALL_KEY == "ta_cle_api_ici":
+        print("❌ ERREUR: Configure ta clé API-Football dans le fichier .env")
+        print("   API_FOOTBALL_KEY=ta_cle_api_ici")
+        return
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Commandes
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("live", cmd_live))
+    app.add_handler(CommandHandler("leagues", cmd_leagues))
+    app.add_handler(CommandHandler("sensitivity", cmd_sensitivity))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("activate", cmd_activate))
+    app.add_handler(CommandHandler("lang", cmd_lang))
+    app.add_handler(CommandHandler("referral", cmd_referral))
+    app.add_handler(CommandHandler("best", cmd_best))
+    app.add_handler(CommandHandler("next", cmd_next))
+
+    # Callbacks (boutons inline)
+    app.add_handler(CallbackQueryHandler(callback_plan, pattern=r"^plan_"))
+    app.add_handler(CallbackQueryHandler(callback_stripe, pattern=r"^stripe_"))
+    app.add_handler(CallbackQueryHandler(callback_stars, pattern=r"^stars_"))
+    app.add_handler(CallbackQueryHandler(callback_league, pattern=r"^league_"))
+    app.add_handler(CallbackQueryHandler(callback_lang, pattern=r"^lang_"))
+
+    # Paiement Telegram Stars
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+
+    # Jobs planifies
+    job_queue = app.job_queue
+    job_queue.run_repeating(check_matches, interval=CHECK_INTERVAL_SECONDS, first=10)
+    job_queue.run_repeating(check_expired_plans, interval=60, first=30)
+    job_queue.run_repeating(check_stripe_payments, interval=30, first=15)
+
+    print("[OK] Goal Signal Bot demarre !")
+    print(f"   Scan toutes les {CHECK_INTERVAL_SECONDS}s")
+    print(f"   Seuil par defaut: {DEFAULT_CONFIDENCE_THRESHOLD}/100")
+    print("   Ctrl+C pour arreter")
+
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
