@@ -2,3 +2,9 @@ python-telegram-bot[job-queue]==21.10
 httpx==0.28.1
 python-dotenv==1.1.0
 gspread==6.1.4
+tweepy==4.14.0
+fastapi==0.115.0
+uvicorn==0.30.6
+google-auth==2.35.0
+PyJWT==2.9.0
+stripe

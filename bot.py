@@ -494,6 +494,16 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
         logger.info("Referral credit (Stars): user %s -> parrain %s (total: %d)", chat_id, referrer, new_count)
 
 
+async def cmd_testtwitter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/testtwitter — Admin: teste la connexion Twitter et les credentials."""
+    if update.effective_chat.id != ADMIN_ID:
+        return
+    from twitter_bot import test_twitter_connection
+    await update.message.reply_text("Test de connexion Twitter en cours...")
+    status = test_twitter_connection()
+    await update.message.reply_text(f"Twitter: {status}")
+
+
 async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/activate <user_id> <plan> — Admin: activer manuellement un plan."""
     chat_id = update.effective_chat.id
@@ -1749,6 +1759,7 @@ def main() -> None:
     app.add_handler(CommandHandler("sensitivity", cmd_sensitivity))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("activate", cmd_activate))
+    app.add_handler(CommandHandler("testtwitter", cmd_testtwitter))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CommandHandler("referral", cmd_referral))
     app.add_handler(CommandHandler("best", cmd_best))

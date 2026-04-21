@@ -5,14 +5,14 @@ import logging
 import random
 from datetime import datetime, timedelta
 from collections import defaultdict
+from config import (
+    TWITTER_API_KEY as API_KEY,
+    TWITTER_API_SECRET as API_SECRET,
+    TWITTER_ACCESS_TOKEN as ACCESS_TOKEN,
+    TWITTER_ACCESS_SECRET as ACCESS_SECRET,
+)
 
 logger = logging.getLogger(__name__)
-
-# Twitter API credentials
-API_KEY = "UR4GDy51JR7HXZMck18hQJODs"
-API_SECRET = "KOjDFxm3WZTNs3tEf76QbjSGKWykZkmAMlVLnWBA16GgCbGzvj"
-ACCESS_TOKEN = "2005762468094828544-cffWnTjtPb3SCd5YD7aHnYHKWL1Me9"
-ACCESS_SECRET = "gvyfkPo9WTgIfBM37dvrpRJQjviswG4wDOtlWl3rMP0FD"
 
 POSITIVE_PHRASES = [
     "La regularite paie, encore une journee solide",
@@ -69,13 +69,33 @@ HASHTAGS = "#TeamParieur #ParisSportifs #PronoFoot #Betting #Football"
 
 def get_twitter_client():
     """Cree un client Twitter API v2."""
-    client = tweepy.Client(
+    if not all([API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_SECRET]):
+        raise ValueError("Credentials Twitter manquants dans .env (TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET)")
+    return tweepy.Client(
         consumer_key=API_KEY,
         consumer_secret=API_SECRET,
         access_token=ACCESS_TOKEN,
         access_token_secret=ACCESS_SECRET,
+        wait_on_rate_limit=True,
     )
-    return client
+
+
+def test_twitter_connection() -> str:
+    """Teste la connexion Twitter. Retourne un message de statut."""
+    try:
+        client = get_twitter_client()
+        me = client.get_me()
+        if me and me.data:
+            return f"OK — connecte en tant que @{me.data.username}"
+        return "OK — connecte (pas de username retourne)"
+    except ValueError as e:
+        return f"ERREUR config: {e}"
+    except tweepy.errors.Unauthorized as e:
+        return f"ERREUR 401 — Credentials invalides ou revoquees: {e}"
+    except tweepy.errors.Forbidden as e:
+        return f"ERREUR 403 — Acces refuse (verifier les permissions de l'app sur developer.twitter.com): {e}"
+    except Exception as e:
+        return f"ERREUR: {type(e).__name__}: {e}"
 
 
 def post_tweet(text, reply_to=None):
@@ -89,9 +109,17 @@ def post_tweet(text, reply_to=None):
         tweet_id = response.data["id"]
         logger.info("Tweet poste (id=%s): %s", tweet_id, text[:60])
         return tweet_id
+    except tweepy.errors.Unauthorized as e:
+        logger.error("Tweet ERREUR 401 — credentials invalides ou revoquees: %s", e)
+    except tweepy.errors.Forbidden as e:
+        logger.error("Tweet ERREUR 403 — acces refuse (verifier permissions app Twitter): %s", e)
+    except tweepy.errors.TooManyRequests as e:
+        logger.error("Tweet ERREUR 429 — rate limit atteint: %s", e)
+    except ValueError as e:
+        logger.error("Tweet ERREUR config: %s", e)
     except Exception as e:
-        logger.error("Erreur tweet: %s", e)
-        return None
+        logger.error("Tweet ERREUR inattendue (%s): %s", type(e).__name__, e)
+    return None
 
 
 def post_thread(tweets):
