@@ -104,7 +104,7 @@ def post_tweet(text, reply_to=None):
         client = get_twitter_client()
         kwargs = {"text": text}
         if reply_to:
-            kwargs["in_reply_to_tweet_id"] = reply_to
+            kwargs["reply"] = {"in_reply_to_tweet_id": reply_to}
         response = client.create_tweet(**kwargs)
         tweet_id = response.data["id"]
         logger.info("Tweet poste (id=%s): %s", tweet_id, text[:60])
