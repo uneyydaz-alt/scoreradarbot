@@ -66,6 +66,22 @@ WEEKLY_NEGATIVE = [
 
 HASHTAGS = "#TeamParieur #ParisSportifs #PronoFoot #Betting #Football"
 
+TWEET_LIMIT = 270  # marge de sécurité sous la limite X de 280
+
+def _jlen(lines):
+    """Longueur exacte du tweet si on joint les lignes par \\n."""
+    return sum(len(l) for l in lines) + max(0, len(lines) - 1)
+
+def _sanitize(tweets):
+    """Filet de sécurité final : tronque tout tweet qui dépasse 280 chars."""
+    out = []
+    for t in tweets:
+        if len(t) > 280:
+            logger.warning("Tweet tronqué (%d→280) : %s…", len(t), t[:50])
+            t = t[:279] + "…"
+        out.append(t)
+    return out
+
 
 def get_twitter_client():
     """Cree un client Twitter API v2."""
@@ -101,6 +117,9 @@ def test_twitter_connection() -> str:
 def post_tweet(text, reply_to=None):
     """Poste un tweet. Retourne le tweet ID ou None."""
     try:
+        if len(text) > 280:
+            logger.warning("Tweet envoyé trop long (%d chars), tronqué à 280", len(text))
+            text = text[:279] + "…"
         client = get_twitter_client()
         kwargs = {"text": text}
         if reply_to:
@@ -202,42 +221,36 @@ def build_daily_recap(results):
     t1.extend(footer_t1)
     tweets.append(joiner.join(t1))
 
-    # Tweets par ligue — on accumule ligne par ligne sans jamais dépasser 275 chars
+    # Tweets par ligue — on accumule ligne par ligne sans jamais dépasser TWEET_LIMIT
     sorted_leagues = sorted(by_league.items(), key=lambda x: len(x[1]), reverse=True)
-    MAX = 275
     cur = []
-    cur_len = 0
 
-    def flush(buf):
-        if buf:
-            tweets.append(joiner.join(buf))
-        return [], 0
+    def flush_cur():
+        if cur:
+            tweets.append(joiner.join(cur))
+        cur.clear()
 
-    def add_line(cur, cur_len, line):
-        """Ajoute une ligne, flush si nécessaire. Retourne (cur, cur_len)."""
-        needed = len(line) + (1 if cur else 0)
-        if cur and cur_len + needed > MAX:
-            cur, cur_len = flush(cur)
+    def add_line(line):
+        """Ajoute une ligne au buffer, flush d'abord si ça dépasserait TWEET_LIMIT."""
+        if _jlen(cur + [line]) > TWEET_LIMIT and cur:
+            flush_cur()
         cur.append(line)
-        cur_len += len(line) + 1
-        return cur, cur_len
 
     for league, lr in sorted_leagues:
         lw = sum(1 for r in lr if r.get("result") == "Win")
         ll = sum(1 for r in lr if r.get("result") == "Lose")
-        header = "🏆 " + league
-        cur, cur_len = add_line(cur, cur_len, header)
+        add_line("🏆 " + league)
         for r in lr:
-            cur, cur_len = add_line(cur, cur_len, _match_line(r))
-        cur, cur_len = add_line(cur, cur_len, str(lw) + "W/" + str(ll) + "L")
-        cur, cur_len = add_line(cur, cur_len, "")
-    flush(cur)
+            add_line(_match_line(r))
+        add_line(str(lw) + "W/" + str(ll) + "L")
+        add_line("")
+    flush_cur()
 
     # Dernier tweet: bilan
     final = ["📊 " + str(total) + " picks | " + str(wins) + "W " + str(loses) + "L | " + str(wr) + "% WR",
              "", phrase, "", HASHTAGS]
     tweets.append(joiner.join(final))
-    return tweets
+    return _sanitize(tweets)
 
 def build_weekend_teaser(match_count):
     """Construit le tweet teaser du week-end."""
@@ -310,7 +323,7 @@ def build_weekly_thread(results):
     t1_content = "\n".join([header, "", title, ""] + selected + ["", footer])
     tweets.append(t1_content)
 
-    # --- Tweets 2+: par ligue (decoupage ligne par ligne, jamais > 278 chars) ---
+    # --- Tweets 2+: par ligue (decoupage ligne par ligne, jamais > TWEET_LIMIT) ---
     by_league = defaultdict(list)
     for r in results:
         league = r.get("league", "Autre")
@@ -318,7 +331,6 @@ def build_weekly_thread(results):
 
     sorted_leagues = sorted(by_league.items(), key=lambda x: len(x[1]), reverse=True)
 
-    LIMIT = 278
     current_lines = []
 
     def flush():
@@ -327,8 +339,8 @@ def build_weekly_thread(results):
             current_lines.clear()
 
     def try_add(line):
-        candidate = (chr(10).join(current_lines + [line])) if current_lines else line
-        if len(candidate) > LIMIT and current_lines:
+        """Ajoute une ligne, flush d'abord si ça dépasserait TWEET_LIMIT."""
+        if _jlen(current_lines + [line]) > TWEET_LIMIT and current_lines:
             flush()
         current_lines.append(line)
 
@@ -336,31 +348,26 @@ def build_weekly_thread(results):
         league_w = sum(1 for r in league_results if r.get("result") == "Win")
         league_l = sum(1 for r in league_results if r.get("result") == "Lose")
 
-        header = "🏆 " + league
         match_lines = []
         for r in league_results:
             icon = "✅" if r.get("result") == "Win" else "❌"
             score = str(r.get("home_goals", "?")) + "-" + str(r.get("away_goals", "?"))
-            ml = icon + " " + r.get("home", "?") + " " + score + " " + r.get("away", "?")
-            ml += " — " + r.get("pick", "?")
+            ml = icon + " " + r.get("home", "?") + " " + score + " " + r.get("away", "?") + " — " + r.get("pick", "?")
             match_lines.append(ml)
         summary = str(league_w) + "W/" + str(league_l) + "L"
 
-        block_lines = [header] + match_lines + [summary, ""]
-        full_block = chr(10).join(block_lines)
-        candidate_with_current = (chr(10).join(current_lines + block_lines)) if current_lines else full_block
-
-        if len(full_block) <= LIMIT and len(candidate_with_current) <= LIMIT:
+        block_lines = ["🏆 " + league] + match_lines + [summary, ""]
+        # Si le bloc entier tient avec le buffer courant, on l'ajoute d'un coup
+        if _jlen(current_lines + block_lines) <= TWEET_LIMIT:
             current_lines.extend(block_lines)
-        elif len(full_block) <= LIMIT:
+        elif _jlen(block_lines) <= TWEET_LIMIT:
+            # Le bloc tient seul : flush puis ajouter
             flush()
             current_lines.extend(block_lines)
         else:
-            try_add(header)
-            for ml in match_lines:
-                try_add(ml)
-            try_add(summary)
-            try_add("")
+            # Trop grand : ligne par ligne
+            for line in block_lines:
+                try_add(line)
 
     flush()
 
@@ -379,4 +386,4 @@ def build_weekly_thread(results):
 
     tweets.append("\n".join(final_lines))
 
-    return tweets
+    return _sanitize(tweets)
