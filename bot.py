@@ -42,6 +42,7 @@ from twitter_bot import (
     build_daily_recap, build_weekend_teaser, build_weekly_thread,
     post_tweet, post_thread,
 )
+from odds_api import get_value_bets, format_value_bet
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -1587,6 +1588,65 @@ async def check_matches(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
+# --- Value bets digest (week-end) ---
+
+async def send_value_bets_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Envoie un digest unique des meilleurs value bets du week-end au canal premium."""
+    if not CHANNEL_ID:
+        logger.warning("Value bets digest: CHANNEL_ID non configuré")
+        return
+
+    try:
+        vbs = await get_value_bets(hours_ahead=36)
+    except Exception as e:
+        logger.error("Value bets digest: erreur fetch: %s", e)
+        return
+
+    if not vbs:
+        logger.info("Value bets digest: aucun value bet trouvé (edge >= 4%%)")
+        return
+
+    top = vbs[:8]  # max 8 pour ne pas spammer
+    day = datetime.now(timezone.utc).strftime("%d/%m")
+    lines = [f"📊 Value Bets — {day}\n"]
+
+    for i, vb in enumerate(top, 1):
+        edge = vb["edge"]
+        icon = "🔥" if edge >= 7 else "✅"
+        try:
+            from datetime import datetime as dt
+            ko = dt.fromisoformat(vb["kickoff"].replace("Z", "+00:00"))
+            ko_str = ko.strftime("%H:%M")
+        except Exception:
+            ko_str = "?"
+        lines.append(
+            f"{i}. {vb['home']} vs {vb['away']} — {ko_str}\n"
+            f"   {vb['market']} • {vb['soft_odds']} ({vb['bookmaker']})\n"
+            f"   Prob réelle {vb['true_prob']}% vs implicite {vb['implied_prob']}% • Edge +{edge}% {icon}"
+        )
+
+    lines.append(
+        f"\n🏆 {len(top)} opportunité(s) détectée(s) sur {len(vbs)} analysée(s)"
+        f"\n⚠️ Probabilités calculées via Pinnacle. Pariez de manière responsable."
+    )
+
+    message = "\n\n".join(lines) if len(lines) > 2 else "\n".join(lines)
+    try:
+        await context.bot.send_message(chat_id=CHANNEL_ID, text=message)
+        logger.info("Value bets digest envoyé (%d bets)", len(top))
+    except Exception as e:
+        logger.error("Value bets digest: erreur envoi: %s", e)
+
+
+async def cmd_sendvalue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/sendvalue — Admin: déclenche manuellement le digest value bets."""
+    if update.effective_chat.id != ADMIN_ID:
+        return
+    await update.message.reply_text("Recherche des value bets en cours...")
+    await send_value_bets_digest(context)
+    await update.message.reply_text("Digest envoyé.")
+
+
 # --- Twitter scheduled jobs ---
 
 def _mark_daily_tweet_sent():
@@ -1760,6 +1820,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("activate", cmd_activate))
     app.add_handler(CommandHandler("testtwitter", cmd_testtwitter))
+    app.add_handler(CommandHandler("sendvalue", cmd_sendvalue))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CommandHandler("referral", cmd_referral))
     app.add_handler(CommandHandler("best", cmd_best))
@@ -1782,8 +1843,11 @@ def main() -> None:
     job_queue.run_repeating(check_expired_plans, interval=60, first=30)
     job_queue.run_repeating(check_stripe_payments, interval=30, first=15)
 
-    # Twitter schedulers
+    # Value bets digest : samedi + dimanche à 9h UTC (10h Paris)
     from datetime import time as dt_time
+    job_queue.run_daily(send_value_bets_digest, time=dt_time(hour=9, minute=0), days=(5, 6))
+
+    # Twitter schedulers
     # Daily recap: 22h UTC (23h Paris) tous les jours
     job_queue.run_daily(send_daily_tweet, time=dt_time(hour=22, minute=0))
     # Weekend teaser: 11h UTC (12h Paris) samedi + dimanche
