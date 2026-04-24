@@ -111,6 +111,17 @@ def _analyze(match: dict, min_edge: float = MIN_EDGE) -> list:
     return sorted(found, key=lambda x: x["edge"], reverse=True)
 
 
+def _dedup(vbs: list) -> list:
+    """Garde le meilleur edge par (match + marché)."""
+    seen, unique = set(), []
+    for vb in sorted(vbs, key=lambda x: x["edge"], reverse=True):
+        key = (vb["home"], vb["away"], vb["market"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(vb)
+    return unique
+
+
 async def fetch_value_bets(sports: list, hours_ahead: int = 36, min_edge: float = MIN_EDGE) -> list:
     """Fetch et analyse les value bets sur la liste de sports donnée."""
     now    = datetime.now(timezone.utc)
@@ -118,8 +129,7 @@ async def fetch_value_bets(sports: list, hours_ahead: int = 36, min_edge: float 
     all_vbs = []
 
     for sport in sports:
-        matches = await _fetch(sport)
-        for match in matches:
+        for match in await _fetch(sport):
             try:
                 ko = datetime.fromisoformat(match["commence_time"].replace("Z", "+00:00"))
                 if ko < now or ko > cutoff:
@@ -128,16 +138,57 @@ async def fetch_value_bets(sports: list, hours_ahead: int = 36, min_edge: float 
             except Exception as e:
                 logger.error("Parse error [%s]: %s", sport, e)
 
-    # Déduplique : garde le meilleur edge par (match + marché)
-    seen, unique = set(), []
-    for vb in sorted(all_vbs, key=lambda x: x["edge"], reverse=True):
-        key = (vb["home"], vb["away"], vb["market"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(vb)
-
+    unique = _dedup(all_vbs)
     logger.info("Value bets trouvés : %d (edge ≥ %.0f%%)", len(unique), min_edge * 100)
     return unique
+
+
+async def fetch_schedule_and_bets(sports: list, hours_ahead: int = 36, min_edge: float = MIN_EDGE) -> dict:
+    """
+    Fetch unique du matin : retourne les value bets ET le planning des matchs
+    pour programmer les checks ciblés (KO-5min, MT).
+    """
+    now    = datetime.now(timezone.utc)
+    cutoff = now + timedelta(hours=hours_ahead)
+    all_vbs, schedule = [], []
+    seen_matches = set()
+
+    for sport in sports:
+        for match in await _fetch(sport):
+            try:
+                ko = datetime.fromisoformat(match["commence_time"].replace("Z", "+00:00"))
+                if ko < now or ko > cutoff:
+                    continue
+                all_vbs.extend(_analyze(match, min_edge))
+                key = (match["home_team"], match["away_team"])
+                if key not in seen_matches:
+                    seen_matches.add(key)
+                    schedule.append({
+                        "sport":   sport,
+                        "home":    match["home_team"],
+                        "away":    match["away_team"],
+                        "kickoff": ko,
+                    })
+            except Exception as e:
+                logger.error("Parse error [%s]: %s", sport, e)
+
+    return {"bets": _dedup(all_vbs), "schedule": schedule}
+
+
+async def fetch_sport_value_bets(sport: str, min_edge: float = MIN_EDGE) -> list:
+    """Check ciblé sur un seul sport (utilisé pour KO-5min et MT)."""
+    now = datetime.now(timezone.utc)
+    all_vbs = []
+    for match in await _fetch(sport):
+        try:
+            ko = datetime.fromisoformat(match["commence_time"].replace("Z", "+00:00"))
+            # Uniquement les matchs qui commencent dans les 3 prochaines heures
+            if not (now - timedelta(hours=2) <= ko <= now + timedelta(hours=3)):
+                continue
+            all_vbs.extend(_analyze(match, min_edge))
+        except Exception as e:
+            logger.error("Parse error ciblé [%s]: %s", sport, e)
+    return _dedup(all_vbs)
 
 
 def quota_remaining() -> int | None:
