@@ -5,7 +5,8 @@ load_dotenv()
 
 VALUE_BOT_TOKEN  = os.getenv("VALUE_BOT_TOKEN", "")
 ODDS_API_KEY     = os.getenv("ODDS_API_KEY", "")
-ADMIN_CHAT_ID    = int(os.getenv("VALUE_BOT_ADMIN_ID", "0"))
+_admin_id        = os.getenv("VALUE_BOT_ADMIN_ID", "0")
+ADMIN_CHAT_ID    = _admin_id if _admin_id.startswith("@") else int(_admin_id)
 
 MIN_EDGE         = float(os.getenv("VALUE_BOT_MIN_EDGE", "0.04"))   # 4% par défaut
 CHECK_INTERVAL   = int(os.getenv("VALUE_BOT_CHECK_INTERVAL", "3600"))  # 1h par défaut
