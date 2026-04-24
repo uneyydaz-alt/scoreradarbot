@@ -170,8 +170,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_CHAT_ID:
-        return
     await update.message.reply_text("🔍 Recherche en cours...")
     vbs     = await fetch_value_bets(LIVE_SPORTS, hours_ahead=24, min_edge=MIN_EDGE)
     new_vbs = filter_new(vbs)
@@ -187,8 +185,6 @@ async def cmd_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_CHAT_ID:
-        return
     await update.message.reply_text("📊 Génération du digest + programmation des checks...")
     now    = datetime.now(timezone.utc)
     result = await fetch_schedule_and_bets(DIGEST_SPORTS, hours_ahead=36, min_edge=MIN_EDGE)
