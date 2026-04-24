@@ -10,6 +10,9 @@ API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
 FOOTYSTATS_API_KEY = os.getenv("FOOTYSTATS_API_KEY", "")
 FOOTYSTATS_BASE_URL = "https://api.football-data-api.com"
 
+# The Odds API (value bets pré-match)
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
+
 # Google Sheets
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "")
