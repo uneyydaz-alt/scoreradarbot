@@ -16,7 +16,6 @@ LIVE_SPORTS = [
     "soccer_epl",
     "soccer_spain_la_liga",
     "soccer_france_ligue_one",
-    "soccer_italy_serie_a",
     "soccer_uefa_champs_league",
 ]
 

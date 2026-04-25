@@ -232,9 +232,11 @@ async def job_evening_validation(context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📡 Value Radar Bot\n\n"
-        "Détection de value bets pré-match.\n\n"
-        "/value — Check maintenant (5 ligues)\n"
+        "Détection de value bets pré-match & live.\n\n"
+        "/value — Check value bets à venir (24h)\n"
+        "/live — Check matchs en cours maintenant\n"
         "/digest — Digest complet + programme les checks du jour\n"
+        "/sports — Compétitions surveillées\n"
         "/quota — Quota API restant\n"
         "/status — Statut"
     )
@@ -292,6 +294,50 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_sports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    live_list  = "\n".join(f"  • {s}" for s in LIVE_SPORTS)
+    extra      = [s for s in DIGEST_SPORTS if s not in LIVE_SPORTS]
+    extra_list = "\n".join(f"  • {s}" for s in extra)
+    await update.message.reply_text(
+        f"⚽ Sports surveillés\n\n"
+        f"🔴 Live & Digest ({len(LIVE_SPORTS)}) :\n{live_list}\n\n"
+        f"📊 Digest uniquement ({len(extra)}) :\n{extra_list}\n\n"
+        f"Total : {len(DIGEST_SPORTS)} compétitions"
+    )
+
+
+async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check value bets sur les matchs actuellement en cours."""
+    await update.message.reply_text("🔴 Scan live en cours...")
+    from odds_client import _fetch, _analyze, _dedup
+    now     = datetime.now(timezone.utc)
+    all_vbs = []
+
+    for sport in LIVE_SPORTS:
+        for match in await _fetch(sport):
+            try:
+                ko = datetime.fromisoformat(match["commence_time"].replace("Z", "+00:00"))
+                if not (now - timedelta(minutes=110) <= ko <= now):
+                    continue
+                all_vbs.extend(_analyze(match, MIN_EDGE))
+            except Exception as e:
+                logger.error("Parse error live [%s]: %s", sport, e)
+
+    unique  = _dedup(all_vbs)
+    new_vbs = filter_new(unique)
+
+    if not new_vbs:
+        msg = "Aucun value bet live détecté"
+        if unique:
+            msg += f"\n({len(unique)} trouvé(s) déjà envoyé(s))"
+        await update.message.reply_text(msg)
+        return
+
+    for vb in new_vbs[:5]:
+        await update.message.reply_text(_fmt_alert(vb, "LIVE "))
+        mark_sent(vb["id"])
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -307,6 +353,8 @@ def main():
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("quota",  cmd_quota))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("sports", cmd_sports))
+    app.add_handler(CommandHandler("live",   cmd_live))
 
     # Digest matin + programmation des jobs dynamiques : sam + dim à 9h Paris
     app.job_queue.run_daily(
