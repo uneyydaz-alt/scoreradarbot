@@ -191,5 +191,25 @@ async def fetch_sport_value_bets(sport: str, min_edge: float = MIN_EDGE) -> list
     return _dedup(all_vbs)
 
 
+async def fetch_scores(sports: list) -> list:
+    """Fetch les résultats des matchs terminés aujourd'hui."""
+    global _requests_remaining
+    if not ODDS_API_KEY:
+        return []
+    all_scores = []
+    for sport in sports:
+        try:
+            params = {"apiKey": ODDS_API_KEY, "daysFrom": 1, "dateFormat": "iso"}
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(f"{BASE_URL}/sports/{sport}/scores", params=params)
+            if r.headers.get("x-requests-remaining"):
+                _requests_remaining = int(r.headers["x-requests-remaining"])
+            if r.status_code == 200:
+                all_scores.extend(r.json())
+        except Exception as e:
+            logger.error("Scores fetch error [%s]: %s", sport, e)
+    return all_scores
+
+
 def quota_remaining() -> int | None:
     return _requests_remaining

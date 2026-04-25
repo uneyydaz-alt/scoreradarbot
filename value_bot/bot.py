@@ -11,8 +11,8 @@ from config import (
     VALUE_BOT_TOKEN, ADMIN_CHAT_ID, MIN_EDGE,
     LIVE_SPORTS, DIGEST_SPORTS,
 )
-from odds_client import fetch_schedule_and_bets, fetch_sport_value_bets, fetch_value_bets, quota_remaining
-from tracker import filter_new, mark_all_sent, mark_sent
+from odds_client import fetch_schedule_and_bets, fetch_sport_value_bets, fetch_value_bets, fetch_scores, quota_remaining
+from tracker import filter_new, mark_all_sent, mark_sent, save_digest, load_digest
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -69,8 +69,12 @@ def _fmt_digest(vbs: list) -> str:
     return "\n\n".join(lines)
 
 
-async def _send(bot, text: str):
-    await bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
+async def _send(bot, text: str, reply_to: int = None):
+    return await bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=text,
+        reply_to_message_id=reply_to,
+    )
 
 
 # ── Jobs dynamiques ────────────────────────────────────────────────────────────
@@ -142,8 +146,10 @@ async def job_morning_scan(context: ContextTypes.DEFAULT_TYPE):
 
     # Digest
     if vbs:
-        await _send(context.bot, _fmt_digest(vbs[:10]))
-        mark_all_sent(vbs[:10])
+        top = vbs[:10]
+        msg = await _send(context.bot, _fmt_digest(top))
+        mark_all_sent(top)
+        save_digest(msg.message_id, ADMIN_CHAT_ID, top)
     else:
         await _send(context.bot, f"📊 Aucun value bet détecté ce matin (edge ≥ {MIN_EDGE*100:.0f}%)")
 
@@ -154,6 +160,71 @@ async def job_morning_scan(context: ContextTypes.DEFAULT_TYPE):
         f"⏱ {len(schedule)} match(s) programmé(s) aujourd'hui\n"
         f"→ {nb_jobs} checks automatiques (KO-5min + MT) planifiés"
     )
+
+
+# ── Validation soir ───────────────────────────────────────────────────────────
+
+def _validate_bet(vb: dict, scores: list) -> str | None:
+    """Retourne ✅ ou ❌ si le match est terminé, None sinon."""
+    for match in scores:
+        if not match.get("completed"):
+            continue
+        if match["home_team"] != vb["home"] or match["away_team"] != vb["away"]:
+            continue
+        match_scores = match.get("scores") or []
+        if len(match_scores) < 2:
+            continue
+        score_map  = {s["name"]: int(s["score"]) for s in match_scores}
+        home_score = score_map.get(vb["home"], 0)
+        away_score = score_map.get(vb["away"], 0)
+        total      = home_score + away_score
+        market     = vb["market"]
+        if market.startswith("1X2 — "):
+            outcome = market.replace("1X2 — ", "")
+            if outcome == vb["home"]:
+                won = home_score > away_score
+            elif outcome == vb["away"]:
+                won = away_score > home_score
+            else:
+                won = home_score == away_score
+            return "✅" if won else "❌"
+        elif market.startswith("Over "):
+            return "✅" if total > float(market.split()[1]) else "❌"
+        elif market.startswith("Under "):
+            return "✅" if total < float(market.split()[1]) else "❌"
+    return None
+
+
+async def job_evening_validation(context: ContextTypes.DEFAULT_TYPE):
+    """Valide les paris du matin et reply au digest avec les résultats."""
+    state = load_digest()
+    if not state:
+        logger.info("Validation soir : pas de digest aujourd'hui")
+        return
+
+    scores = await fetch_scores(DIGEST_SPORTS)
+    if not scores:
+        logger.info("Validation soir : aucun résultat disponible")
+        return
+
+    bets  = state["bets"]
+    lines = ["📊 Résultats du jour\n"]
+    nb_validated = 0
+
+    for vb in bets:
+        result = _validate_bet(vb, scores)
+        if result:
+            nb_validated += 1
+            lines.append(f"{result} {vb['home']} vs {vb['away']} — {vb['market']}")
+        else:
+            lines.append(f"⏳ {vb['home']} vs {vb['away']} — résultat non disponible")
+
+    if nb_validated == 0:
+        logger.info("Validation soir : aucun match terminé trouvé")
+        return
+
+    await _send(context.bot, "\n".join(lines), reply_to=state["message_id"])
+    logger.info("Validation soir envoyée : %d/%d matchs validés", nb_validated, len(bets))
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -241,6 +312,13 @@ def main():
     app.job_queue.run_daily(
         job_morning_scan,
         time=dt_time(hour=9, minute=0, tzinfo=PARIS),
+        days=(5, 6),
+    )
+
+    # Validation soir : sam + dim à 23h Paris
+    app.job_queue.run_daily(
+        job_evening_validation,
+        time=dt_time(hour=23, minute=0, tzinfo=PARIS),
         days=(5, 6),
     )
 

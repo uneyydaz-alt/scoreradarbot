@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
-SENT_FILE = Path(__file__).parent / "sent_alerts.json"
+SENT_FILE   = Path(__file__).parent / "sent_alerts.json"
+DIGEST_FILE = Path(__file__).parent / "digest_state.json"
 
 
 def _load() -> dict:
@@ -49,3 +50,30 @@ def filter_new(vbs: list) -> list:
 def mark_all_sent(vbs: list):
     for vb in vbs:
         mark_sent(vb["id"])
+
+
+def save_digest(message_id: int, chat_id, bets: list):
+    """Sauvegarde le message_id du digest matin + les paris pour validation soir."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        DIGEST_FILE.write_text(json.dumps({
+            "date":       today,
+            "message_id": message_id,
+            "chat_id":    str(chat_id),
+            "bets":       bets,
+        }, ensure_ascii=False))
+    except Exception as e:
+        logger.error("Digest state save error: %s", e)
+
+
+def load_digest() -> dict | None:
+    """Charge l'état du digest si c'est bien celui d'aujourd'hui."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        if DIGEST_FILE.exists():
+            data = json.loads(DIGEST_FILE.read_text())
+            if data.get("date") == today:
+                return data
+    except Exception:
+        pass
+    return None
