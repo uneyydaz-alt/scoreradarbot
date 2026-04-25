@@ -15,7 +15,9 @@ import jwt  # PyJWT
 logger = logging.getLogger(__name__)
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
-JWT_SECRET = os.getenv("JWT_SECRET", os.urandom(32).hex())
+JWT_SECRET = os.getenv("JWT_SECRET") or os.urandom(32).hex()
+if not os.getenv("JWT_SECRET"):
+    logger.warning("JWT_SECRET non défini — les sessions seront perdues au redémarrage")
 
 app = FastAPI(title="Score Radar Dashboard")
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
