@@ -1,0 +1,16 @@
+[Unit]
+Description=Value Radar Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/telegram-goal-bot
+ExecStart=/usr/bin/python3 /root/telegram-goal-bot/run_value_bot.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/root/telegram-goal-bot/value_bot.log
+StandardError=append:/root/telegram-goal-bot/value_bot.log
+
+[Install]
+WantedBy=multi-user.target
