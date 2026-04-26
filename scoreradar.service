@@ -1,0 +1,16 @@
+[Unit]
+Description=Score Radar Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/telegram-goal-bot
+ExecStart=/usr/bin/python3 -u /root/telegram-goal-bot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/root/telegram-goal-bot/scoreradar.log
+StandardError=append:/root/telegram-goal-bot/scoreradar.log
+
+[Install]
+WantedBy=multi-user.target
