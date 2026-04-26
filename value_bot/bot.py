@@ -264,11 +264,14 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vbs      = result["bets"]
     schedule = result["schedule"]
     if not vbs:
+        await _send(context.bot, f"📊 Aucun value bet détecté (edge ≥ {MIN_EDGE*100:.0f}%)")
         await update.message.reply_text("Aucun value bet détecté.")
     else:
         top = vbs[:10]
-        await update.message.reply_text(_fmt_digest(top))
+        msg = await _send(context.bot, _fmt_digest(top))
         mark_all_sent(top)
+        save_digest(msg.message_id, ADMIN_CHAT_ID, top)
+        await update.message.reply_text(f"✅ Digest envoyé dans le canal ({len(top)} value bets)")
     nb_jobs = _schedule_match_jobs(context.job_queue, schedule, now)
     await update.message.reply_text(
         f"✅ {len(schedule)} match(s) | {nb_jobs} checks programmés (KO-5min + MT)"
