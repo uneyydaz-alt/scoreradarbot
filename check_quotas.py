@@ -21,7 +21,8 @@ def check_api_football():
             headers={"x-apisports-key": API_FOOTBALL_KEY},
             timeout=10,
         )
-        d = r.json().get("response", {})
+        body = r.json()
+        d = body.get("response", {}) if isinstance(body, dict) else {}
         sub = d.get("subscription", {})
         req = d.get("requests", {})
         plan = sub.get("plan", "?")
