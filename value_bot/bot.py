@@ -280,8 +280,13 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rem = quota_remaining()
-    msg = f"📊 Quota The Odds API : {rem} requêtes restantes" if rem is not None else "Quota inconnu — aucun appel depuis le démarrage."
-    await update.message.reply_text(msg)
+    if not rem:
+        await update.message.reply_text("Quota inconnu — aucun appel depuis le démarrage.")
+        return
+    lines = ["📊 Quota The Odds API\n"]
+    for label, val in rem.items():
+        lines.append(f"• {label} : {val} req restantes")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):

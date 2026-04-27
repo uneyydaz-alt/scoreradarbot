@@ -3,41 +3,60 @@
 import httpx
 import logging
 from datetime import datetime, timezone, timedelta
-from config import ODDS_API_KEY, SOFT_BOOKS, MIN_EDGE
+from config import ODDS_API_KEYS, SOFT_BOOKS, MIN_EDGE
 
 logger = logging.getLogger(__name__)
 BASE_URL = "https://api.the-odds-api.com/v4"
 
-_requests_remaining = None  # suivi du quota
+_remaining: dict[str, int] = {}  # quota restant par clé
+_key_index = 0                   # clé active
+
+
+def _active_key() -> str | None:
+    """Retourne la première clé avec du quota restant."""
+    global _key_index
+    for i in range(len(ODDS_API_KEYS)):
+        idx = (_key_index + i) % len(ODDS_API_KEYS)
+        key = ODDS_API_KEYS[idx]
+        rem = _remaining.get(key)
+        if rem is None or rem > 5:
+            _key_index = idx
+            return key
+    return None
 
 
 async def _fetch(sport: str, markets: str = "h2h,totals") -> list:
-    global _requests_remaining
-    if not ODDS_API_KEY:
-        logger.error("ODDS_API_KEY manquant dans .env")
+    if not ODDS_API_KEYS:
+        logger.error("Aucune ODDS_API_KEY configurée dans .env")
         return []
-    if _requests_remaining is not None and _requests_remaining <= 5:
-        logger.warning("Quota Odds API presque épuisé (%d restants) — fetch ignoré", _requests_remaining)
+
+    key = _active_key()
+    if not key:
+        logger.warning("Toutes les clés Odds API sont épuisées")
         return []
 
     params = {
-        "apiKey":      ODDS_API_KEY,
-        "regions":     "eu,uk",
-        "markets":     markets,
-        "oddsFormat":  "decimal",
-        "bookmakers":  "pinnacle," + ",".join(SOFT_BOOKS),
+        "apiKey":     key,
+        "regions":    "eu,uk",
+        "markets":    markets,
+        "oddsFormat": "decimal",
+        "bookmakers": "pinnacle," + ",".join(SOFT_BOOKS),
     }
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(f"{BASE_URL}/sports/{sport}/odds", params=params)
-        _requests_remaining = int(r.headers.get("x-requests-remaining", -1))
+        rem = int(r.headers.get("x-requests-remaining", -1))
+        _remaining[key] = rem
+        if rem <= 5:
+            logger.warning("Clé %s...%s épuisée (%d restants), bascule sur la suivante", key[:8], key[-4:], rem)
+            _key_index = (ODDS_API_KEYS.index(key) + 1) % len(ODDS_API_KEYS)
         if r.status_code == 200:
-            logger.debug("Odds API [%s] OK — %d req restantes", sport, _requests_remaining)
+            logger.debug("Odds API [%s] OK — %d req restantes (clé %s…)", sport, rem, key[:8])
             return r.json()
         elif r.status_code == 401:
-            logger.error("Odds API 401 — clé invalide")
+            logger.error("Odds API 401 — clé invalide: %s…", key[:8])
         elif r.status_code == 422:
-            pass  # pas de matchs pour ce sport, normal
+            pass
         else:
             logger.error("Odds API [%s] HTTP %d", sport, r.status_code)
     except Exception as e:
@@ -193,17 +212,19 @@ async def fetch_sport_value_bets(sport: str, min_edge: float = MIN_EDGE) -> list
 
 async def fetch_scores(sports: list) -> list:
     """Fetch les résultats des matchs terminés aujourd'hui."""
-    global _requests_remaining
-    if not ODDS_API_KEY:
+    if not ODDS_API_KEYS:
         return []
     all_scores = []
     for sport in sports:
+        key = _active_key()
+        if not key:
+            break
         try:
-            params = {"apiKey": ODDS_API_KEY, "daysFrom": 1, "dateFormat": "iso"}
+            params = {"apiKey": key, "daysFrom": 1, "dateFormat": "iso"}
             async with httpx.AsyncClient(timeout=15) as client:
                 r = await client.get(f"{BASE_URL}/sports/{sport}/scores", params=params)
             if r.headers.get("x-requests-remaining"):
-                _requests_remaining = int(r.headers["x-requests-remaining"])
+                _remaining[key] = int(r.headers["x-requests-remaining"])
             if r.status_code == 200:
                 all_scores.extend(r.json())
         except Exception as e:
@@ -211,5 +232,6 @@ async def fetch_scores(sports: list) -> list:
     return all_scores
 
 
-def quota_remaining() -> int | None:
-    return _requests_remaining
+def quota_remaining() -> dict:
+    """Retourne le quota restant par clé."""
+    return {f"clé {i+1} ({k[:8]}…)": _remaining.get(k, "?") for i, k in enumerate(ODDS_API_KEYS)}

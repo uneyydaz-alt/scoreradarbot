@@ -4,7 +4,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 VALUE_BOT_TOKEN  = os.getenv("VALUE_BOT_TOKEN", "")
-ODDS_API_KEY     = os.getenv("ODDS_API_KEY", "")
+_odds_keys_raw   = os.getenv("ODDS_API_KEYS", os.getenv("ODDS_API_KEY", ""))
+ODDS_API_KEYS    = [k.strip() for k in _odds_keys_raw.split(",") if k.strip()]
 _admin_id        = os.getenv("VALUE_BOT_ADMIN_ID", "0")
 ADMIN_CHAT_ID    = _admin_id if _admin_id.startswith("@") else int(_admin_id)
 
