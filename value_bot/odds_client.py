@@ -234,4 +234,4 @@ async def fetch_scores(sports: list) -> list:
 
 def quota_remaining() -> dict:
     """Retourne le quota restant par clé."""
-    return {f"clé {i+1} ({k[:8]}…)": _remaining.get(k, "?") for i, k in enumerate(ODDS_API_KEYS)}
+    return {f"clé {i+1} ({k[:8]}…)": _remaining.get(k, 500) for i, k in enumerate(ODDS_API_KEYS)}
