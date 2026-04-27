@@ -11,7 +11,7 @@ from config import (
     VALUE_BOT_TOKEN, ADMIN_CHAT_ID, MIN_EDGE,
     LIVE_SPORTS, DIGEST_SPORTS,
 )
-from odds_client import fetch_schedule_and_bets, fetch_sport_value_bets, fetch_value_bets, fetch_scores, quota_remaining
+from odds_client import fetch_schedule_and_bets, fetch_sport_value_bets, fetch_value_bets, fetch_scores, quota_remaining, check_all_quotas
 from tracker import filter_new, mark_all_sent, mark_sent, save_digest, load_digest
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
@@ -377,6 +377,11 @@ def main():
         time=dt_time(hour=23, minute=0, tzinfo=PARIS),
         days=(5, 6),
     )
+
+    async def _on_startup(app):
+        await check_all_quotas()
+
+    app.post_init = _on_startup
 
     print("[OK] Value Radar Bot démarré")
     print("     Digest + jobs dynamiques : sam + dim 9h Paris")

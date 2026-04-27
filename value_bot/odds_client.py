@@ -232,6 +232,20 @@ async def fetch_scores(sports: list) -> list:
     return all_scores
 
 
+async def check_all_quotas():
+    """Vérifie le quota réel de chaque clé via un appel léger au démarrage."""
+    for key in ODDS_API_KEYS:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(f"{BASE_URL}/sports", params={"apiKey": key})
+            rem = int(r.headers.get("x-requests-remaining", -1))
+            if rem >= 0:
+                _remaining[key] = rem
+                logger.info("Clé %s… : %d req restantes", key[:8], rem)
+        except Exception as e:
+            logger.error("Quota check error clé %s…: %s", key[:8], e)
+
+
 def quota_remaining() -> dict:
     """Retourne le quota restant par clé."""
-    return {f"clé {i+1} ({k[:8]}…)": _remaining.get(k, 500) for i, k in enumerate(ODDS_API_KEYS)}
+    return {f"clé {i+1} ({k[:8]}…)": _remaining.get(k, "?") for i, k in enumerate(ODDS_API_KEYS)}
