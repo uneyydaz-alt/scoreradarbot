@@ -9,7 +9,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from config import (
     VALUE_BOT_TOKEN, ADMIN_CHAT_ID, MIN_EDGE,
-    LIVE_SPORTS, DIGEST_SPORTS, TENNIS_RAPIDAPI_KEY,
+    LIVE_SPORTS, DIGEST_SPORTS, TENNIS_RAPIDAPI_KEYS,
 )
 from odds_client import fetch_schedule_and_bets, fetch_sport_value_bets, fetch_value_bets, fetch_scores, quota_remaining, check_all_quotas
 from tracker import filter_new, mark_all_sent, mark_sent, save_digest, load_digest
@@ -426,10 +426,10 @@ async def cmd_deep(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if sport_label == "tennis":
-            if not TENNIS_RAPIDAPI_KEY:
-                await update.message.reply_text("❌ TENNIS_RAPIDAPI_KEY manquante dans .env")
+            if not TENNIS_RAPIDAPI_KEYS:
+                await update.message.reply_text("❌ TENNIS_RAPIDAPI_KEYS manquante dans .env")
                 return
-            data = await analyze_tennis(home, away, TENNIS_RAPIDAPI_KEY)
+            data = await analyze_tennis(home, away)
         else:
             data = await analyze_football(home, away)
 

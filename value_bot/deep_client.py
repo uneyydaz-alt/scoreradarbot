@@ -6,12 +6,22 @@ import logging
 import math
 from datetime import datetime, timezone, timedelta
 
-from config import ODDS_API_KEYS, SOFT_BOOKS
+from config import ODDS_API_KEYS, SOFT_BOOKS, TENNIS_RAPIDAPI_KEYS
 
 logger = logging.getLogger(__name__)
 
 TENNIS_HOST = "tennisapi1.p.rapidapi.com"
 TENNIS_BASE = f"https://{TENNIS_HOST}/api/tennis"
+
+_tennis_key_index = 0
+
+def _active_tennis_key() -> str | None:
+    global _tennis_key_index
+    if not TENNIS_RAPIDAPI_KEYS:
+        return None
+    key = TENNIS_RAPIDAPI_KEYS[_tennis_key_index % len(TENNIS_RAPIDAPI_KEYS)]
+    _tennis_key_index = (_tennis_key_index + 1) % len(TENNIS_RAPIDAPI_KEYS)
+    return key
 
 FOOTBALL_KEYWORDS = {
     "fc", "cf", "sc", "ac", "rc", "as", "ss", "us", "sk", "fk", "nk", "bk",
@@ -224,22 +234,30 @@ async def _find_tennis_odds(p1: str, p2: str) -> dict | None:
 
 # ── Tennis RapidAPI ────────────────────────────────────────────────────────────
 
-async def _tennis_get(path: str, key: str) -> dict | list:
+async def _tennis_get(path: str, key: str = None) -> dict | list:
+    if not key:
+        key = _active_tennis_key()
+    if not key:
+        logger.error("Aucune clé Tennis RapidAPI configurée")
+        return {}
     headers = {"x-rapidapi-host": TENNIS_HOST, "x-rapidapi-key": key}
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(f"{TENNIS_BASE}{path}", headers=headers)
         if r.status_code == 200:
             return r.json()
-        logger.error("Tennis API HTTP %d %s", r.status_code, path)
+        if r.status_code == 429:
+            logger.warning("Tennis API 429 (quota) sur clé %s…, rotation", key[:8])
+        else:
+            logger.error("Tennis API HTTP %d %s", r.status_code, path)
     except Exception as e:
         logger.error("Tennis API error %s: %s", path, e)
     return {}
 
 
-async def _search_player(name: str, key: str) -> dict | None:
+async def _search_player(name: str) -> dict | None:
     encoded = name.replace(" ", "%20")
-    data = await _tennis_get(f"/player/search/{encoded}", key)
+    data = await _tennis_get(f"/player/search/{encoded}")
     items = data if isinstance(data, list) else (data.get("athletes") or data.get("results") or [])
     if items:
         return items[0]
@@ -378,12 +396,12 @@ async def analyze_football(home: str, away: str) -> dict:
     }
 
 
-async def analyze_tennis(p1: str, p2: str, tennis_key: str) -> dict:
+async def analyze_tennis(p1: str, p2: str, tennis_key: str = None) -> dict:
     """Analyse complète d'un match tennis via RapidAPI + The Odds API."""
     # 1. Recherche joueurs
     player1, player2 = await asyncio.gather(
-        _search_player(p1, tennis_key),
-        _search_player(p2, tennis_key),
+        _search_player(p1),
+        _search_player(p2),
     )
     if not player1 or not player2:
         missing = p1 if not player1 else p2
@@ -394,9 +412,9 @@ async def analyze_tennis(p1: str, p2: str, tennis_key: str) -> dict:
 
     # 2. Fetch H2H + résultats récents en parallèle
     h2h_raw, p1_res_raw, p2_res_raw = await asyncio.gather(
-        _tennis_get(f"/player/h2h/{p1_id}/{p2_id}", tennis_key),
-        _tennis_get(f"/player/{p1_id}/results", tennis_key),
-        _tennis_get(f"/player/{p2_id}/results", tennis_key),
+        _tennis_get(f"/player/h2h/{p1_id}/{p2_id}"),
+        _tennis_get(f"/player/{p1_id}/results"),
+        _tennis_get(f"/player/{p2_id}/results"),
     )
 
     # 3. Cotes The Odds API

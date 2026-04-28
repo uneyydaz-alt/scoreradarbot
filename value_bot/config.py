@@ -13,6 +13,8 @@ MIN_EDGE         = float(os.getenv("VALUE_BOT_MIN_EDGE", "0.04"))   # 4% par dé
 CHECK_INTERVAL   = int(os.getenv("VALUE_BOT_CHECK_INTERVAL", "3600"))  # 1h par défaut
 
 TENNIS_RAPIDAPI_KEY = os.getenv("TENNIS_RAPIDAPI_KEY", "")
+_tennis_keys_raw    = os.getenv("TENNIS_RAPIDAPI_KEYS", TENNIS_RAPIDAPI_KEY)
+TENNIS_RAPIDAPI_KEYS = [k.strip() for k in _tennis_keys_raw.split(",") if k.strip()]
 
 # Ligues pour le monitoring live (budget limité — free tier 500 req/mois)
 LIVE_SPORTS = [
