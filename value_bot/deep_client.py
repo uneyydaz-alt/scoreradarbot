@@ -32,6 +32,93 @@ ALL_FOOTBALL_SPORTS = [
     "soccer_italy_serie_a",
 ]
 
+# Abréviations → mots-clés qui apparaissent dans le nom API
+TEAM_ALIASES: dict[str, list[str]] = {
+    "psg":          ["paris saint-germain", "paris sg"],
+    "man utd":      ["manchester united"],
+    "man united":   ["manchester united"],
+    "man city":     ["manchester city"],
+    "barca":        ["barcelona", "fc barcelona"],
+    "barça":        ["barcelona", "fc barcelona"],
+    "atleti":       ["atletico madrid", "atlético"],
+    "atletico":     ["atletico madrid", "atlético"],
+    "inter":        ["inter milan", "internazionale"],
+    "juve":         ["juventus"],
+    "juventus":     ["juventus"],
+    "napoli":       ["napoli", "ssc napoli"],
+    "milan":        ["ac milan"],
+    "ac milan":     ["ac milan"],
+    "real":         ["real madrid"],
+    "ajax":         ["ajax"],
+    "dortmund":     ["dortmund", "borussia dortmund"],
+    "bvb":          ["borussia dortmund"],
+    "leverkusen":   ["bayer leverkusen"],
+    "leipzig":      ["rb leipzig"],
+    "lyon":         ["olympique lyonnais", "lyon"],
+    "marseille":    ["olympique de marseille", "marseille"],
+    "porto":        ["fc porto"],
+    "benfica":      ["sl benfica", "benfica"],
+    "celtic":       ["celtic"],
+    "rangers":      ["rangers"],
+    "wolves":       ["wolverhampton"],
+    "spurs":        ["tottenham"],
+    "palace":       ["crystal palace"],
+    "leicester":    ["leicester city"],
+    "newcastle":    ["newcastle united"],
+    "brighton":     ["brighton"],
+    "villa":        ["aston villa"],
+    "west ham":     ["west ham united"],
+    "chelsea":      ["chelsea"],
+    "arsenal":      ["arsenal"],
+    "liverpool":    ["liverpool"],
+    "everton":      ["everton"],
+    "bayern":       ["fc bayern", "bayern munich", "bayern münchen"],
+    "feyenoord":    ["feyenoord"],
+    "psv":          ["psv eindhoven"],
+    "anderlecht":   ["rsc anderlecht"],
+    "bruges":       ["club brugge", "bruges"],
+    "braga":        ["sc braga"],
+    "sevilla":      ["sevilla fc"],
+    "valencia":     ["valencia cf"],
+    "villarreal":   ["villarreal"],
+    "sociedad":     ["real sociedad"],
+}
+
+
+_NORMALIZE = str.maketrans("àáâãäåæçèéêëìíîïðñòóôõöùúûüýÿ",
+                           "aaaaaааceeeeiiiiðnoooooуuuuуy")
+
+
+def _norm(s: str) -> str:
+    """Normalise : minuscule + accents retirés."""
+    return s.lower().translate(_NORMALIZE)
+
+
+def _resolve_aliases(name: str) -> list[str]:
+    """Retourne les variantes connues d'un nom d'équipe (normalisées)."""
+    key = _norm(name.strip())
+    variants = [key]
+    if key in TEAM_ALIASES:
+        variants.extend([_norm(v) for v in TEAM_ALIASES[key]])
+    # Cherche aussi une correspondance partielle dans les clés
+    for alias_key, alias_vals in TEAM_ALIASES.items():
+        if alias_key in key or key in alias_key:
+            variants.extend([_norm(v) for v in alias_vals])
+    return list(dict.fromkeys(variants))
+
+
+def _match_team(search: str, api_name: str) -> bool:
+    """Vérifie si search correspond à api_name (fuzzy + aliases + normalisation)."""
+    api_n = _norm(api_name)
+    for variant in _resolve_aliases(search):
+        if variant in api_n or api_n in variant:
+            return True
+    # Matching mot-à-mot : chaque mot significatif du search dans le nom API
+    sig_words = [w for w in _norm(search).split() if len(w) > 3]
+    if sig_words and all(w in api_n for w in sig_words):
+        return True
+    return False
+
 TENNIS_SPORTS = [
     "tennis_atp_french_open", "tennis_wta_french_open",
     "tennis_atp_us_open", "tennis_wta_us_open",
@@ -110,31 +197,27 @@ async def _fetch_odds(sport: str, markets: str = "h2h,totals") -> list:
 
 
 async def _find_match_odds(home: str, away: str) -> dict | None:
-    """Cherche un match dans toutes les ligues foot."""
-    home_l = home.lower()
-    away_l = away.lower()
+    """Cherche un match dans toutes les ligues foot (fuzzy + aliases)."""
     for sport in ALL_FOOTBALL_SPORTS:
         for match in await _fetch_odds(sport):
-            mh = match.get("home_team", "").lower()
-            ma = match.get("away_team", "").lower()
-            if (home_l in mh or mh in home_l) and (away_l in ma or ma in away_l):
+            mh = match.get("home_team", "")
+            ma = match.get("away_team", "")
+            if _match_team(home, mh) and _match_team(away, ma):
                 return match
-            if (away_l in mh or mh in away_l) and (home_l in ma or ma in home_l):
-                # reversed order
+            if _match_team(away, mh) and _match_team(home, ma):
                 return match
     return None
 
 
 async def _find_tennis_odds(p1: str, p2: str) -> dict | None:
-    """Cherche un match tennis dans The Odds API."""
-    p1l, p2l = p1.lower(), p2.lower()
+    """Cherche un match tennis dans The Odds API (fuzzy)."""
     for sport in TENNIS_SPORTS:
         for match in await _fetch_odds(sport, "h2h"):
-            mh = match.get("home_team", "").lower()
-            ma = match.get("away_team", "").lower()
-            if (p1l in mh or mh in p1l) and (p2l in ma or ma in p2l):
+            mh = match.get("home_team", "")
+            ma = match.get("away_team", "")
+            if _match_team(p1, mh) and _match_team(p2, ma):
                 return match
-            if (p2l in mh or mh in p2l) and (p1l in ma or ma in p1l):
+            if _match_team(p2, mh) and _match_team(p1, ma):
                 return match
     return None
 

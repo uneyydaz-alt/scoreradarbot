@@ -434,7 +434,12 @@ async def cmd_deep(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data = await analyze_football(home, away)
 
         if data.get("error"):
-            await update.message.reply_text(f"❌ {data['error']}")
+            msg = f"❌ {data['error']}\n\n"
+            if sport_label == "foot":
+                msg += "💡 Essaie avec le nom complet :\n/deep Paris Saint-Germain vs Bayern Munich\nOu le match n'est pas encore disponible dans l'API."
+            else:
+                msg += "💡 Essaie avec le nom complet du joueur :\n/deep Jannik Sinner vs Carlos Alcaraz"
+            await update.message.reply_text(msg)
             return
 
         if sport_label == "tennis":
