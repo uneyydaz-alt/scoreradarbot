@@ -12,6 +12,8 @@ ADMIN_CHAT_ID    = _admin_id if _admin_id.startswith("@") else int(_admin_id)
 MIN_EDGE         = float(os.getenv("VALUE_BOT_MIN_EDGE", "0.04"))   # 4% par défaut
 CHECK_INTERVAL   = int(os.getenv("VALUE_BOT_CHECK_INTERVAL", "3600"))  # 1h par défaut
 
+TENNIS_RAPIDAPI_KEY = os.getenv("TENNIS_RAPIDAPI_KEY", "")
+
 # Ligues pour le monitoring live (budget limité — free tier 500 req/mois)
 LIVE_SPORTS = [
     "soccer_epl",

@@ -9,10 +9,11 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from config import (
     VALUE_BOT_TOKEN, ADMIN_CHAT_ID, MIN_EDGE,
-    LIVE_SPORTS, DIGEST_SPORTS,
+    LIVE_SPORTS, DIGEST_SPORTS, TENNIS_RAPIDAPI_KEY,
 )
 from odds_client import fetch_schedule_and_bets, fetch_sport_value_bets, fetch_value_bets, fetch_scores, quota_remaining, check_all_quotas
 from tracker import filter_new, mark_all_sent, mark_sent, save_digest, load_digest
+from deep_client import analyze_football, analyze_tennis, is_tennis
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -236,6 +237,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/value — Check value bets à venir (24h)\n"
         "/live — Check matchs en cours maintenant\n"
         "/digest — Digest complet + programme les checks du jour\n"
+        "/deep <équipe1> vs <équipe2> — Analyse approfondie (Poisson / tennis stats)\n"
         "/sports — Compétitions surveillées\n"
         "/quota — Quota API restant\n"
         "/status — Statut"
@@ -314,6 +316,139 @@ async def cmd_sports(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _fmt_deep_football(d: dict) -> str:
+    from zoneinfo import ZoneInfo
+    PARIS = ZoneInfo("Europe/Paris")
+    ko_str = d["kickoff"].astimezone(PARIS).strftime("%d/%m %H:%M") if d.get("kickoff") else "?"
+    lines = [
+        f"🔬 ANALYSE APPROFONDIE — {d['league']}\n",
+        f"⚽ {d['home']} vs {d['away']}",
+        f"🕐 {ko_str}\n",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"📊 PROBABILITÉS PINNACLE (vraies)",
+        f"  • {d['home']} : {d['pinnacle_1x2']['home']}%",
+        f"  • Nul : {d['pinnacle_1x2']['draw']}%",
+        f"  • {d['away']} : {d['pinnacle_1x2']['away']}%",
+        f"  • Over {d['over_line']} buts : {d['p_over']}%",
+        f"  • Under {d['over_line']} buts : {d['p_under']}%",
+    ]
+    if d.get("lambda_home") and d.get("top_scores"):
+        lines += [
+            f"\n🎯 MODÈLE POISSON",
+            f"  λ domicile : {d['lambda_home']} buts attendus",
+            f"  λ extérieur : {d['lambda_away']} buts attendus",
+            f"\n  Scores les plus probables :",
+        ]
+        for h, a, p in d["top_scores"][:5]:
+            lines.append(f"  • {h}-{a}  →  {p:.1f}%")
+    if d.get("best_odds"):
+        lines.append(f"\n💰 MEILLEURES COTES vs PINNACLE")
+        for b in d["best_odds"][:6]:
+            edge_icon = "🔥" if b["edge"] >= 5 else ("✅" if b["edge"] >= 2 else "  ")
+            lines.append(
+                f"  {edge_icon} {b['market']}\n"
+                f"     {b['soft_odds']} chez {b['bookmaker']} "
+                f"(juste: {b['fair_odds']}, prob: {b['true_prob']}%, edge: {b['edge']:+.1f}%)"
+            )
+    lines.append("\n⚠️ Modèle probabiliste — pas de conseil de mise.")
+    return "\n".join(lines)
+
+
+def _fmt_deep_tennis(d: dict) -> str:
+    p1 = d["player1"]
+    p2 = d["player2"]
+    r1 = f"#{p1['rank']}" if p1.get("rank") else "N/C"
+    r2 = f"#{p2['rank']}" if p2.get("rank") else "N/C"
+    lines = [
+        f"🔬 ANALYSE APPROFONDIE — TENNIS\n",
+        f"🎾 {p1['name']} ({p1['country']}) vs {p2['name']} ({p2['country']})",
+        f"  Classements : {p1['name'].split()[-1]} {r1}  •  {p2['name'].split()[-1]} {r2}\n",
+        f"━━━━━━━━━━━━━━━━━━━━",
+    ]
+    total = d["h2h_total"]
+    if total > 0:
+        lines += [
+            f"📋 HEAD-TO-HEAD ({total} rencontres)",
+            f"  • {p1['name']} : {d['h2h_p1_wins']} victoire(s)",
+            f"  • {p2['name']} : {d['h2h_p2_wins']} victoire(s)",
+        ]
+        if d.get("h2h_recent"):
+            lines.append("  Dernières rencontres :")
+            for r in d["h2h_recent"]:
+                lines.append(f"    – {r}")
+    else:
+        lines.append("📋 Pas de H2H disponible")
+
+    def _fmt_form(player_name: str, results: list) -> list:
+        out = [f"\n📈 Forme récente — {player_name}"]
+        if not results:
+            out.append("  Données non disponibles")
+            return out
+        for r in results:
+            score = f" ({r['score']})" if r.get("score") else ""
+            out.append(f"  • {r.get('tournament','?')}{score}")
+        return out
+
+    lines += _fmt_form(p1["name"], d.get("p1_form", []))
+    lines += _fmt_form(p2["name"], d.get("p2_form", []))
+
+    if d.get("odds"):
+        lines.append(f"\n💰 COTES PINNACLE")
+        for name, info in d["odds"].items():
+            best = f"  → meilleur: {info['best_odds']} chez {info['best_book']}" if info.get("best_odds") else ""
+            edge = ""
+            if info.get("best_odds") and info.get("true_prob"):
+                e = round(info["best_odds"] * info["true_prob"] / 100 - 1, 3) * 100
+                edge = f" (edge: {e:+.1f}%)"
+            lines.append(f"  • {name} : prob {info['true_prob']}% | cote Pinnacle {info['pinnacle_odds']}{best}{edge}")
+
+    lines.append("\n⚠️ Données RapidAPI Tennis — à croiser avec l'actualité.")
+    return "\n".join(lines)
+
+
+async def cmd_deep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Analyse approfondie : /deep PSG vs Bayern  ou  /deep Sinner vs Alcaraz"""
+    raw = " ".join(context.args).strip() if context.args else ""
+    if not raw or " vs " not in raw.lower():
+        await update.message.reply_text(
+            "Usage : /deep <équipe1> vs <équipe2>\n"
+            "Ex : /deep PSG vs Bayern Munich\n"
+            "Ex : /deep Sinner vs Alcaraz"
+        )
+        return
+
+    sep = raw.lower().index(" vs ")
+    home = raw[:sep].strip()
+    away = raw[sep + 4:].strip()
+
+    sport_label = "tennis" if is_tennis(home, away) else "foot"
+    await update.message.reply_text(f"🔬 Analyse {sport_label} en cours : {home} vs {away}...")
+
+    try:
+        if sport_label == "tennis":
+            if not TENNIS_RAPIDAPI_KEY:
+                await update.message.reply_text("❌ TENNIS_RAPIDAPI_KEY manquante dans .env")
+                return
+            data = await analyze_tennis(home, away, TENNIS_RAPIDAPI_KEY)
+        else:
+            data = await analyze_football(home, away)
+
+        if data.get("error"):
+            await update.message.reply_text(f"❌ {data['error']}")
+            return
+
+        if sport_label == "tennis":
+            text = _fmt_deep_tennis(data)
+        else:
+            text = _fmt_deep_football(data)
+
+        await update.message.reply_text(text)
+
+    except Exception as e:
+        logger.error("cmd_deep error: %s", e)
+        await update.message.reply_text(f"❌ Erreur lors de l'analyse : {e}")
+
+
 async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check value bets sur les matchs actuellement en cours."""
     await update.message.reply_text("🔴 Scan live en cours...")
@@ -363,6 +498,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("sports", cmd_sports))
     app.add_handler(CommandHandler("live",   cmd_live))
+    app.add_handler(CommandHandler("deep",   cmd_deep))
 
     # Digest matin + programmation des jobs dynamiques : sam + dim à 9h Paris
     app.job_queue.run_daily(
