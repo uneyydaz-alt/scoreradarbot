@@ -79,9 +79,20 @@ def _analyze(match: dict, min_edge: float = MIN_EDGE) -> list:
     if not pinnacle:
         return []
 
+    # Pour les totals, on keye par (mkey, point) pour éviter de mélanger
+    # Under 2.5 Pinnacle avec Under 3.5 William Hill → faux edges massifs
     ref = {}
     for mkt in pinnacle["markets"]:
-        ref[mkt["key"]] = _true_probs(mkt["outcomes"])
+        if mkt["key"] == "totals":
+            for o in mkt["outcomes"]:
+                pt = o.get("point", "")
+                rkey = ("totals", pt)
+                if rkey not in ref:
+                    # Recalcule les probs uniquement pour ce point
+                    same_pt = [x for x in mkt["outcomes"] if x.get("point", "") == pt]
+                    ref[rkey] = _true_probs(same_pt)
+        else:
+            ref[mkt["key"]] = _true_probs(mkt["outcomes"])
 
     found = []
     for bkey, book in books.items():
@@ -89,12 +100,24 @@ def _analyze(match: dict, min_edge: float = MIN_EDGE) -> list:
             continue
         for mkt in book["markets"]:
             mkey = mkt["key"]
-            if mkey not in ref:
-                continue
             for outcome in mkt["outcomes"]:
                 name      = outcome["name"]
                 soft_odds = outcome["price"]
-                true_p    = ref[mkey].get(name)
+
+                if mkey == "totals":
+                    pt   = outcome.get("point", "")
+                    rkey = ("totals", pt)
+                    if rkey not in ref:
+                        continue
+                    true_p = ref[rkey].get(name)
+                    label  = f"{'Over' if name == 'Over' else 'Under'} {pt}"
+                else:
+                    if mkey not in ref:
+                        continue
+                    true_p = ref[mkey].get(name)
+                    label  = f"1X2 — {name}" if mkey == "h2h" else f"{mkey} — {name}"
+                    pt     = ""
+
                 if not true_p or soft_odds <= 1:
                     continue
                 edge = true_p * soft_odds - 1
@@ -102,16 +125,9 @@ def _analyze(match: dict, min_edge: float = MIN_EDGE) -> list:
                     continue
 
                 fair = 1 / true_p
-                if mkey == "h2h":
-                    label = f"1X2 — {name}"
-                elif mkey == "totals":
-                    pt = outcome.get("point", "")
-                    label = f"{'Over' if name == 'Over' else 'Under'} {pt}"
-                else:
-                    label = f"{mkey} — {name}"
 
                 found.append({
-                    "id":           f"{match['id']}_{mkey}_{name}",
+                    "id":           f"{match['id']}_{mkey}_{pt}_{name}",
                     "home":         match["home_team"],
                     "away":         match["away_team"],
                     "league":       match.get("sport_title", ""),
