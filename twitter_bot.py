@@ -66,6 +66,48 @@ WEEKLY_NEGATIVE = [
 
 HASHTAGS = "#TeamParieur #ParisSportifs #PronoFoot #Betting #Football"
 
+VALUE_HASHTAGS = "#teamparieur #teamparieurs"
+
+COUNTRY_FLAGS = {
+    "Turkey": "🇹🇷",
+    "France": "🇫🇷",
+    "England": "🏴󠁧󠁢󠁥󠁮󠁧󠁿",
+    "Spain": "🇪🇸",
+    "Germany": "🇩🇪",
+    "Italy": "🇮🇹",
+    "Portugal": "🇵🇹",
+    "Netherlands": "🇳🇱",
+    "Belgium": "🇧🇪",
+    "Argentina": "🇦🇷",
+    "Brazil": "🇧🇷",
+    "USA": "🇺🇸",
+    "Russia": "🇷🇺",
+    "Saudi Arabia": "🇸🇦",
+    "China": "🇨🇳",
+    "Japan": "🇯🇵",
+    "Mexico": "🇲🇽",
+    "Colombia": "🇨🇴",
+    "Algeria": "🇩🇿",
+    "Australia": "🇦🇺",
+    "Austria": "🇦🇹",
+    "Chile": "🇨🇱",
+    "Croatia": "🇭🇷",
+    "Denmark": "🇩🇰",
+    "Ecuador": "🇪🇨",
+    "Israel": "🇮🇱",
+    "Norway": "🇳🇴",
+    "Scotland": "🏴󠁧󠁢󠁳󠁣󠁴󠁿",
+    "Switzerland": "🇨🇭",
+    "Greece": "🇬🇷",
+    "Poland": "🇵🇱",
+    "Romania": "🇷🇴",
+    "Sweden": "🇸🇪",
+    "Ukraine": "🇺🇦",
+    "Serbia": "🇷🇸",
+    "World": "🌍",
+    "Europe": "🇪🇺",
+}
+
 
 def get_twitter_client():
     """Cree un client Twitter API v2."""
@@ -352,3 +394,32 @@ def build_weekly_thread(results):
     tweets.append("\n".join(final_lines))
 
     return tweets
+
+
+# --- Value bet alert ---
+
+def build_value_tweet(action: dict) -> str:
+    """Construit le tweet d'alerte value bet + drop de cotes.
+
+    Format :
+        ✈️ Direction 🇹🇷
+
+        ✅ Value détectée à 1.73. 🤖
+        📉 Drop à 1.56.
+
+        #teamparieur #teamparieurs
+    """
+    country = action.get("country", "")
+    flag = COUNTRY_FLAGS.get(country, "🌍")
+    initial = action["initial_odds"]
+    current = action["current_odds"]
+
+    lines = [
+        f"✈️ Direction {flag}",
+        "",
+        f"✅ Value détectée à {initial:.2f}. 🤖",
+        f"📉 Drop à {current:.2f}.",
+        "",
+        VALUE_HASHTAGS,
+    ]
+    return "\n".join(lines)

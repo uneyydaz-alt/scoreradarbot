@@ -40,8 +40,9 @@ from footystats import get_todays_matches, find_match_data, parse_prematch_data
 from translations import t, get_lang, LANG_FLAGS, SUPPORTED_LANGS
 from twitter_bot import (
     build_daily_recap, build_weekend_teaser, build_weekly_thread,
-    post_tweet, post_thread,
+    post_tweet, post_thread, build_value_tweet,
 )
+from value_detector import check_value_bets
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -1590,6 +1591,22 @@ def _daily_tweet_already_sent():
     except FileNotFoundError:
         return False
 
+async def check_prematch_value(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scanne les cotes pré-match et poste sur Twitter quand une value chute."""
+    try:
+        actions = await check_value_bets()
+        for action in actions:
+            tweet = build_value_tweet(action)
+            tweet_id = post_tweet(tweet)
+            if tweet_id:
+                logger.info(
+                    "Tweet value posté (id=%s): %s @ %.2f → %.2f",
+                    tweet_id, action["team"], action["initial_odds"], action["current_odds"],
+                )
+    except Exception as e:
+        logger.error("Erreur check_prematch_value: %s", e)
+
+
 async def send_daily_tweet(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Poste le recap quotidien sur Twitter (22h UTC = 23h Paris)."""
     try:
@@ -1781,6 +1798,9 @@ def main() -> None:
     from zoneinfo import ZoneInfo
     _paris = ZoneInfo("Europe/Paris")
     job_queue.run_daily(send_weekly_tweet, time=dt_time(hour=23, minute=30, tzinfo=_paris), days=(6,))
+
+    # Value bet detector: scan pré-match toutes les 5 minutes
+    job_queue.run_repeating(check_prematch_value, interval=300, first=90)
 
     # Catch-up: si le bot demarre apres 22h UTC et que le recap n'a pas ete envoye
     now_utc = datetime.now(timezone.utc)
