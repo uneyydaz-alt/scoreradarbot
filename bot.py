@@ -33,7 +33,7 @@ from config import (
     ADMIN_ID,
     REFERRAL_TIERS,
 )
-from api_football import get_live_fixtures, get_fixture_by_id, get_fixture_statistics, parse_fixture_info, parse_statistics, get_live_odds
+from api_football import get_live_fixtures, get_fixture_by_id, get_fixture_statistics, parse_fixture_info, parse_statistics, get_live_odds, get_quota
 from analyzer import analyze_match, format_signal
 from google_sheets import log_alert, update_result, update_live_colors, get_pending_rows, finalize_row
 from footystats import get_todays_matches, find_match_data, parse_prematch_data
@@ -818,6 +818,31 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 
+
+
+# --- /quota --- Quota API ---
+
+async def cmd_quota(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/quota — Quota API-Football restant (admin only)."""
+    if update.effective_chat.id != ADMIN_ID:
+        return
+    await update.message.reply_text("📊 Vérification des quotas...")
+    q = await get_quota()
+    if not q:
+        await update.message.reply_text("❌ Impossible de récupérer le quota.")
+        return
+    remaining = q.get("remaining", "?")
+    used = q.get("used", "?")
+    limit = q.get("limit", "?")
+    plan = q.get("plan", "?")
+    icon = "🔴" if isinstance(remaining, int) and remaining < 20 else "🟢"
+    await update.message.reply_text(
+        f"📊 Quota API-Football\n\n"
+        f"• Plan : {plan}\n"
+        f"• Utilisées aujourd'hui : {used} / {limit}\n"
+        f"• {icon} Restantes : {remaining}\n\n"
+        f"⏱ Renouvellement à minuit UTC"
+    )
 
 
 # --- /best --- Top 5 picks de la semaine ---
@@ -1818,6 +1843,7 @@ def main() -> None:
     app.add_handler(CommandHandler("leagues", cmd_leagues))
     app.add_handler(CommandHandler("sensitivity", cmd_sensitivity))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("quota", cmd_quota))
     app.add_handler(CommandHandler("activate", cmd_activate))
     app.add_handler(CommandHandler("testtwitter", cmd_testtwitter))
     app.add_handler(CommandHandler("sendvalue", cmd_sendvalue))
