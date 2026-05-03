@@ -162,6 +162,26 @@ async def get_live_odds(fixture_id: int, over_line: float) -> float:
         return 0.0
 
 
+async def get_quota() -> dict:
+    """Retourne les infos de quota API-Football via /status."""
+    try:
+        data = await _get("status")
+        resp = data.get("response", {})
+        requests = resp.get("requests", {})
+        subscription = resp.get("subscription", {})
+        return {
+            "plan": subscription.get("plan", "?"),
+            "used": requests.get("current", "?"),
+            "limit": requests.get("limit_day", "?"),
+            "remaining": (requests["limit_day"] - requests["current"])
+                         if isinstance(requests.get("limit_day"), int) and isinstance(requests.get("current"), int)
+                         else "?",
+        }
+    except Exception as e:
+        logger.error("Erreur get_quota: %s", e)
+        return {}
+
+
 def parse_statistics(stats_response: List[dict]) -> dict:
     """Parse les statistiques d'un match en un dict utilisable.
 

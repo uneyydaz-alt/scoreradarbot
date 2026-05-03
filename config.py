@@ -10,6 +10,9 @@ API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
 FOOTYSTATS_API_KEY = os.getenv("FOOTYSTATS_API_KEY", "")
 FOOTYSTATS_BASE_URL = "https://api.football-data-api.com"
 
+# The Odds API (value bets pré-match)
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
+
 # Google Sheets
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "")
@@ -50,6 +53,12 @@ PLANS = {
 
 # Intervalle de vérification des matchs (en secondes)
 CHECK_INTERVAL_SECONDS = 120
+
+# Twitter / X
+TWITTER_API_KEY        = os.getenv("TWITTER_API_KEY", "")
+TWITTER_API_SECRET     = os.getenv("TWITTER_API_SECRET", "")
+TWITTER_ACCESS_TOKEN   = os.getenv("TWITTER_ACCESS_TOKEN", "")
+TWITTER_ACCESS_SECRET  = os.getenv("TWITTER_ACCESS_SECRET", "")
 
 # Fichier de stockage des utilisateurs
 USERS_FILE = "users.json"

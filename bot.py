@@ -33,7 +33,7 @@ from config import (
     ADMIN_ID,
     REFERRAL_TIERS,
 )
-from api_football import get_live_fixtures, get_fixture_by_id, get_fixture_statistics, parse_fixture_info, parse_statistics, get_live_odds
+from api_football import get_live_fixtures, get_fixture_by_id, get_fixture_statistics, parse_fixture_info, parse_statistics, get_live_odds, get_quota
 from analyzer import analyze_match, format_signal
 from google_sheets import log_alert, update_result, update_live_colors, get_pending_rows, finalize_row
 from footystats import get_todays_matches, find_match_data, parse_prematch_data
@@ -42,6 +42,7 @@ from twitter_bot import (
     build_daily_recap, build_weekend_teaser, build_weekly_thread,
     post_tweet, post_thread,
 )
+from odds_api import get_value_bets, format_value_bet
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -494,6 +495,16 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
         logger.info("Referral credit (Stars): user %s -> parrain %s (total: %d)", chat_id, referrer, new_count)
 
 
+async def cmd_testtwitter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/testtwitter — Admin: teste la connexion Twitter et les credentials."""
+    if update.effective_chat.id != ADMIN_ID:
+        return
+    from twitter_bot import test_twitter_connection
+    await update.message.reply_text("Test de connexion Twitter en cours...")
+    status = test_twitter_connection()
+    await update.message.reply_text(f"Twitter: {status}")
+
+
 async def cmd_activate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/activate <user_id> <plan> — Admin: activer manuellement un plan."""
     chat_id = update.effective_chat.id
@@ -807,6 +818,31 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 
+
+
+# --- /quota --- Quota API ---
+
+async def cmd_quota(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/quota — Quota API-Football restant (admin only)."""
+    if update.effective_chat.id != ADMIN_ID:
+        return
+    await update.message.reply_text("📊 Vérification des quotas...")
+    q = await get_quota()
+    if not q:
+        await update.message.reply_text("❌ Impossible de récupérer le quota.")
+        return
+    remaining = q.get("remaining", "?")
+    used = q.get("used", "?")
+    limit = q.get("limit", "?")
+    plan = q.get("plan", "?")
+    icon = "🔴" if isinstance(remaining, int) and remaining < 20 else "🟢"
+    await update.message.reply_text(
+        f"📊 Quota API-Football\n\n"
+        f"• Plan : {plan}\n"
+        f"• Utilisées aujourd'hui : {used} / {limit}\n"
+        f"• {icon} Restantes : {remaining}\n\n"
+        f"⏱ Renouvellement à minuit UTC"
+    )
 
 
 # --- /best --- Top 5 picks de la semaine ---
@@ -1577,6 +1613,65 @@ async def check_matches(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
+# --- Value bets digest (week-end) ---
+
+async def send_value_bets_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Envoie un digest unique des meilleurs value bets du week-end au canal premium."""
+    if not CHANNEL_ID:
+        logger.warning("Value bets digest: CHANNEL_ID non configuré")
+        return
+
+    try:
+        vbs = await get_value_bets(hours_ahead=36)
+    except Exception as e:
+        logger.error("Value bets digest: erreur fetch: %s", e)
+        return
+
+    if not vbs:
+        logger.info("Value bets digest: aucun value bet trouvé (edge >= 4%%)")
+        return
+
+    top = vbs[:8]  # max 8 pour ne pas spammer
+    day = datetime.now(timezone.utc).strftime("%d/%m")
+    lines = [f"📊 Value Bets — {day}\n"]
+
+    for i, vb in enumerate(top, 1):
+        edge = vb["edge"]
+        icon = "🔥" if edge >= 7 else "✅"
+        try:
+            from datetime import datetime as dt
+            ko = dt.fromisoformat(vb["kickoff"].replace("Z", "+00:00"))
+            ko_str = ko.strftime("%H:%M")
+        except Exception:
+            ko_str = "?"
+        lines.append(
+            f"{i}. {vb['home']} vs {vb['away']} — {ko_str}\n"
+            f"   {vb['market']} • {vb['soft_odds']} ({vb['bookmaker']})\n"
+            f"   Prob réelle {vb['true_prob']}% vs implicite {vb['implied_prob']}% • Edge +{edge}% {icon}"
+        )
+
+    lines.append(
+        f"\n🏆 {len(top)} opportunité(s) détectée(s) sur {len(vbs)} analysée(s)"
+        f"\n⚠️ Probabilités calculées via Pinnacle. Pariez de manière responsable."
+    )
+
+    message = "\n\n".join(lines) if len(lines) > 2 else "\n".join(lines)
+    try:
+        await context.bot.send_message(chat_id=CHANNEL_ID, text=message)
+        logger.info("Value bets digest envoyé (%d bets)", len(top))
+    except Exception as e:
+        logger.error("Value bets digest: erreur envoi: %s", e)
+
+
+async def cmd_sendvalue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/sendvalue — Admin: déclenche manuellement le digest value bets."""
+    if update.effective_chat.id != ADMIN_ID:
+        return
+    await update.message.reply_text("Recherche des value bets en cours...")
+    await send_value_bets_digest(context)
+    await update.message.reply_text("Digest envoyé.")
+
+
 # --- Twitter scheduled jobs ---
 
 def _mark_daily_tweet_sent():
@@ -1748,7 +1843,10 @@ def main() -> None:
     app.add_handler(CommandHandler("leagues", cmd_leagues))
     app.add_handler(CommandHandler("sensitivity", cmd_sensitivity))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("quota", cmd_quota))
     app.add_handler(CommandHandler("activate", cmd_activate))
+    app.add_handler(CommandHandler("testtwitter", cmd_testtwitter))
+    app.add_handler(CommandHandler("sendvalue", cmd_sendvalue))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(CommandHandler("referral", cmd_referral))
     app.add_handler(CommandHandler("best", cmd_best))
@@ -1771,8 +1869,11 @@ def main() -> None:
     job_queue.run_repeating(check_expired_plans, interval=60, first=30)
     job_queue.run_repeating(check_stripe_payments, interval=30, first=15)
 
-    # Twitter schedulers
+    # Value bets digest : samedi + dimanche à 9h UTC (10h Paris)
     from datetime import time as dt_time
+    job_queue.run_daily(send_value_bets_digest, time=dt_time(hour=9, minute=0), days=(5, 6))
+
+    # Twitter schedulers
     # Daily recap: 22h UTC (23h Paris) tous les jours
     job_queue.run_daily(send_daily_tweet, time=dt_time(hour=22, minute=0))
     # Weekend teaser: 11h UTC (12h Paris) samedi + dimanche
